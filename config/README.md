@@ -32,3 +32,32 @@ FlareSolverr 里跟站点绑定的三项不算基础设施，它们描述"访问
 
 改文件后 `/reload` 生效；也可以让主人发 `/fs on`、`/fs off` 运行时切换（会同时
 写回这个文件），`/fs` 不带参数查看当前通道状态。
+
+## 浏览器指纹与自定义 Cookie（yiff）
+
+`cf_clearance` 只证明"有浏览器解过挑战"，Cloudflare 同时还看 TLS / HTTP2 指纹：
+httpx 的握手形状一看就是脚本，光有 cookie 照样 403。想让请求真正"像浏览器"，
+配 `yiff.json` 的 `browser` 段：
+
+```jsonc
+"browser": {
+  "impersonate": "chrome124",   // 留空=不启用指纹；可选 chrome/chrome124/firefox135/safari184…
+  "sync_ua": true,              // 把指纹 UA 同步给 FlareSolverr 与请求头（cf_clearance 与 UA 绑定，必须一致）
+  "user_agent": "",             // 手动指定 UA 时优先（自己保证与指纹一致）
+  "cookies": {"login": "xxx"},  // 站点 Cookie（登录态、手填的 cf_clearance…）
+  "cookie": "",                 // 或直接贴字符串 "a=1; b=2"（与 cookies 等价）
+  "cookie_domains": [],         // 额外要发 Cookie 的域名（图片在 CDN 子域时填它）
+  "headers": {},                // 附加请求头
+  "proxy": "", "verify": true
+}
+```
+
+要点：
+
+- 依赖 `curl_cffi`（`pip install curl_cffi`）。**没装不会报错**，自动退回 httpx，
+  只是没有指纹 —— 日志里会有提示，`/fs` 也能看到"未生效"。
+- `impersonate` 一开，UA 会自动换成对应浏览器的 UA，并同步给无头浏览器解挑战用。
+  e621/e926 这类站要求"UA 带用户名、且不许用浏览器 UA"，与 CF 的要求冲突，
+  二选一：要么关掉 `impersonate` 守站点规矩，要么开指纹 + `sync_ua` 先过 CF。
+- Cookie 只发给站点主域（+ `cookie_domains`），不会泄漏给 CDN / 第三方域；
+  走 FlareSolverr 时解出的 `cf_clearance` 会自动追加到 `cookies` 之上（同名覆盖）。

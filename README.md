@@ -190,6 +190,10 @@ cfg.reset()            # 恢复默认值
 | `default_tags` | 不带参数时的默认标签 |
 | `flaresolverr.enabled` | **取图通道开关**：`true` 走 FlareSolverr 解挑战，`false` 纯直连（默认 `true`） |
 | `flaresolverr.user_agent` | 无头浏览器用的 UA（e621 禁浏览器 UA，需填合规 UA）；直连时也是它 |
+| `browser.impersonate` | **浏览器指纹**：`chrome124` / `chrome` / `firefox135` / `safari184`…，留空=不启用 |
+| `browser.cookies` / `browser.cookie` | 站点 Cookie：dict 或 `"a=1; b=2"` 字符串（登录态、手填的 cf_clearance） |
+| `browser.sync_ua` | 启用指纹时把指纹 UA 同步给 FlareSolverr 与请求头（默认 `true`） |
+| `browser.cookie_domains` | 额外要发 Cookie 的域名（图片在 CDN 子域时填它） |
 | `pool.size` | 预热池容量 |
 | `pool.low_water` | 低于此数量开始补货 |
 | `pool.refill_interval` | 补货检查间隔（秒） |
@@ -229,6 +233,30 @@ cfg.reset()            # 恢复默认值
 通道切换只重建取图客户端，**图池不用重建** —— 它每次取图都现调 `fs()`，
 下一个请求自动走新通道。切走 FlareSolverr 时会 destroy 浏览器 session，
 切回来则在后台预热（解挑战可能要几十秒，不阻塞指令）。
+
+### 浏览器指纹 + 自定义 Cookie
+
+光有 `cf_clearance` 还不够：Cloudflare 同时看 TLS / HTTP2 指纹，httpx 的握手
+形状一看就是脚本，照样 403。要真正"像浏览器"，装 `curl_cffi` 并在
+`config/yiff.json` 里配 `browser` 段：
+
+```jsonc
+"browser": {
+  "impersonate": "chrome124",          // 留空=不启用指纹
+  "sync_ua": true,                     // 指纹 UA 同步给无头浏览器（cf_clearance 与 UA 绑定）
+  "cookies": { "login": "xxx" },       // 站点 Cookie，或 "cookie": "a=1; b=2"
+  "cookie_domains": [],                // 额外要发 Cookie 的域名（CDN 子域）
+  "headers": {}
+}
+```
+
+- 两条通道（FlareSolverr / 直连）都支持，装没装 curl_cffi 都能跑：没装时自动退回
+  httpx 并打一条 warning，功能不受影响，只是没指纹
+- Cookie 只发给站点主域 + `cookie_domains`，不会泄漏给 CDN / 第三方域
+- **注意冲突**：e621/e926 要求 UA 带用户名且不许用浏览器 UA，而开了指纹就得用
+  浏览器 UA，二选一（见 `config/README.md` 的说明）
+
+详见 `config/README.md`。
 
 `entry_url`（触发挑战的入口页）默认就等于 `site`，`session_name` 默认取站点域名，
 **都不需要配**。只有 UA 必须自己填 —— 它是站点对爬虫的合规要求，没法从地址推出来。

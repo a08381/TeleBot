@@ -20,6 +20,12 @@ e621/e926 相关的**全部**参数都在这里 —— 站点地址、默认标�
 两种切法：
 - 改 config/yiff.json 的 flaresolverr.enabled，然后 /reload
 - 主人直接发 /fs on、/fs off，运行时立即生效并写回配置文件
+
+过 CF 还需要「浏览器指纹」（config/yiff.json 的 browser 段）：
+cf_clearance 只证明"有人用浏览器解过挑战"，CF 同时还在看 TLS/HTTP2 指纹，
+httpx 的握手一看就是脚本。填 browser.impersonate（chrome124 等）后请求会由
+curl_cffi 发出，指纹与真实浏览器一致；自定义 Cookie 也在这段里配。
+没装 curl_cffi 时自动退回 httpx，日志会提示，功能本身不受影响。
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from pathlib import PurePosixPath
 from typing import Optional
 
 from core import BotError, Context, Keyboard, button, listener, plugin_config, shutdown, startup
+from utils.browser_profile import BrowserProfile
 from utils.fs_pool import configure_site, fs, fs_health, set_mode
 from utils.posts_pool import PoolSettings, Post, get_pool, pool_start, pool_stop
 
@@ -62,6 +69,24 @@ cfg = plugin_config({
         "user_agent": "MyTgBot/1.0 (by a08381 on e621)",
     },
 
+    # ---- 浏览器指纹 + 自定义 Cookie ----
+    # cf_clearance 只能证明「解挑战的那台浏览器」，CF 还会看 TLS/HTTP2 指纹：
+    # httpx 的握手形状一看就是脚本，所以想稳过 CF 得让请求也像浏览器。
+    # impersonate 填 chrome124 / chrome / firefox135 / safari184 等即启用
+    # （依赖 pip install curl_cffi，没装就自动退回 httpx，不会报错）。
+    "browser": {
+        "_comment": "impersonate 留空=不启用指纹；启用后 UA 会自动换成对应浏览器的 UA（cf_clearance 与 UA 绑定，必须一致）。cookies/cookie 二选一，写站点 Cookie（登录态、手填的 cf_clearance 等）",
+        "impersonate": "",              # 浏览器指纹：chrome124 / firefox135 / safari184 ...
+        "sync_ua": True,                # 启用指纹时，把指纹 UA 同步给 FlareSolverr 与请求头
+        "user_agent": "",               # 手动指定 UA（优先于自动推导，自己保证与指纹一致）
+        "cookies": {},                  # {"cf_clearance": "xxx", "login": "yyy"}
+        "cookie": "",                   # 或直接贴字符串："a=1; b=2"
+        "cookie_domains": [],           # 额外要发 Cookie 的域名（图片在 CDN 子域时填它）
+        "headers": {},                  # 附加请求头，如 {"Referer": "https://e621.net/"}
+        "proxy": "",                    # 留空则用 FlareSolverr 通道的代理设置
+        "verify": True,                 # 关掉可跳过证书校验（自签/中间人时用，不建议）
+    },
+
     # ---- 发送 ----
     "upload_limit_mb": 20,         # 自下载后上传的体积上限（MB）
     "photo_exts": [".jpg", ".jpeg", ".png", ".webp", ".gif"],   # 走 photo 而非 document 的扩展名
@@ -89,7 +114,8 @@ def _save_fs_enabled(enabled: bool) -> None:
 
 # 把站点信息交给取图客户端单例。必须在模块顶层执行：
 # 插件 import（load_all_plugins）早于 post_init，fs() 首次调用时参数已就位。
-# 改了 site / UA / enabled 后 /reload 即可 —— fs() 发现站点或通道变了会重建客户端。
+# 改了 site / UA / enabled / browser 后 /reload 即可 —— fs() 发现站点、通道或
+# 浏览器身份变了会重建客户端。
 # entry_url / session_name 一般不用管，需要单独指定时往 config/yiff.json 的
 # flaresolverr 段里加这两个键即可（plugin_config 不会删掉多出来的字段）。
 def _configure_site() -> None:
@@ -101,6 +127,7 @@ def _configure_site() -> None:
         session_name=fs_cfg.get("session_name"),
         source="yiff",
         enabled=_fs_enabled(),
+        browser=cfg.get("browser"),     # 浏览器指纹 + 自定义 Cookie
     )
 
 
@@ -279,13 +306,28 @@ async def _status_text() -> str:
         f"当前取图通道：{'FlareSolverr' if fs_mode else '直连'}",
         f"站点：{cfg.get('site')}",
     ]
+
+    # 浏览器指纹：装了 curl_cffi 且填了 impersonate 才真的生效
+    fp = health.get("impersonate") or ""
+    if not fp:
+        lines.append("浏览器指纹：未启用（pip install curl_cffi 后在 browser.impersonate 填 chrome124）")
+    elif health.get("fingerprint_active"):
+        lines.append(f"浏览器指纹：{fp}（已生效）")
+    else:
+        lines.append(f"浏览器指纹：{fp}（未生效，缺 curl_cffi）")
+    if health.get("cookies"):
+        lines.append(f"自定义 Cookie：{', '.join(health['cookies'])}")
+
     if fs_mode:
         if health.get("has_clearance"):
             lines.append(f"cf_clearance：有效（{health.get('expires_in')}s 后过期）")
         else:
             lines.append("cf_clearance：暂无，首次取图时会解挑战")
-    else:
-        lines.append(f"UA：{_fs_cfg().get('user_agent') or '（未配置，用默认）'}")
+
+    # 实际发出的 UA：开了指纹会被换成浏览器 UA，这里显示的是替换之后的值
+    browser = BrowserProfile.from_mapping(cfg.get("browser") or {})
+    ua = health.get("user_agent") or browser.effective_ua(_fs_cfg().get("user_agent") or "")
+    lines.append(f"UA：{ua or '（未配置，用默认）'}")
     return "\n".join(lines)
 
 

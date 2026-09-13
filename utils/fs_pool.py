@@ -30,13 +30,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, replace
-from typing import Any, Optional, Union
+from dataclasses import dataclass, field, replace
+from typing import Any, Mapping, Optional, Union
 from urllib.parse import urlparse
 
 import httpx
 
 from .async_flaresolverr import AsyncFlareSolverrClient
+from .browser_profile import (
+    BrowserProfile,
+    aclose_client,
+    create_client,
+)
 from .config import get_config
 
 logger = logging.getLogger(__name__)
@@ -55,10 +60,24 @@ class SiteProfile:
     user_agent: Optional[str] = None    # 强制无头浏览器使用的 UA（有些站禁浏览器 UA）
     source: str = ""                    # 谁注册的（插件名），仅用于日志
     use_fs: bool = True                 # True=走 FlareSolverr 解挑战；False=纯直连
+    browser: BrowserProfile = field(default_factory=BrowserProfile)  # 指纹 + 自定义 Cookie
 
     def __post_init__(self) -> None:
         if not self.site_url and not self.entry_url:
             raise ValueError("site_url 与 entry_url 至少要有一个")
+
+    @property
+    def cookie_hosts(self) -> tuple[str, ...]:
+        """Cookie 绑定域名：站点主域 + browser.cookie_domains（CDN 子域要自己加）。"""
+        return self.browser.domains_for(self.entry_url, self.site_url)
+
+    def describe_browser(self) -> str:
+        """给日志/状态用的一句话描述。"""
+        if not self.browser.wants_fingerprint:
+            return "无指纹（httpx）"
+        if not self.browser.enabled:
+            return f"{self.browser.impersonate}（未生效：缺 curl_cffi）"
+        return f"{self.browser.impersonate}"
 
 
 def _normalize_entry(url: str) -> str:
@@ -83,6 +102,34 @@ def _derive_session(entry_url: str) -> str:
 _current_site: Optional[SiteProfile] = None
 
 
+def _as_browser_profile(
+    browser: Optional[Union[BrowserProfile, Mapping[str, Any]]],
+    *,
+    impersonate: Optional[str] = None,
+    cookies: Optional[Mapping[str, str]] = None,
+) -> BrowserProfile:
+    """把插件传进来的 browser 配置统一成 BrowserProfile。
+
+    支持三种写法：直接给 BrowserProfile、给 config 里的 dict、或不给（默认无指纹）。
+    impersonate / cookies 两个便捷参数会覆盖 dict 里的同名项。
+    """
+    if browser is None:
+        profile = BrowserProfile()
+    elif isinstance(browser, BrowserProfile):
+        profile = browser
+    else:
+        profile = BrowserProfile.from_mapping(browser)
+
+    patch: dict[str, Any] = {}
+    if impersonate is not None:
+        patch["impersonate"] = impersonate
+    if cookies:
+        merged = dict(profile.cookies)
+        merged.update({str(k): str(v) for k, v in cookies.items()})
+        patch["cookies"] = merged
+    return replace(profile, **patch) if patch else profile
+
+
 def configure_site(
     site_url: str,
     user_agent: Optional[str] = None,
@@ -91,14 +138,23 @@ def configure_site(
     session_name: Optional[str] = None,
     source: str = "",
     enabled: bool = True,
+    browser: Optional[Union[BrowserProfile, Mapping[str, Any]]] = None,
+    impersonate: Optional[str] = None,
+    cookies: Optional[Mapping[str, str]] = None,
 ) -> SiteProfile:
-    """由插件声明「我要访问哪个站、走不走 FlareSolverr」。
+    """由插件声明「我要访问哪个站、走不走 FlareSolverr、带什么指纹和 Cookie」。
 
     只需要站点地址：entry_url 默认就是站点根，session_name 默认取站点域名。
     少数站点的根地址不触发挑战、必须用特定 URL 解时，才需要单独指定 entry_url。
 
     enabled=False 时 fs() 返回直连客户端（DirectClient），不启动浏览器、不连
     FlareSolverr；站点没上挑战或 FlareSolverr 不可用时用它。
+
+    browser 描述浏览器身份（见 utils.browser_profile.BrowserProfile）：
+    - impersonate  填 chrome124 / firefox135 之类即启用 TLS/HTTP2 指纹（需装 curl_cffi）
+    - cookies      站点 Cookie（登录态、手填的 cf_clearance…），两条通道都带
+    - headers      附加请求头
+    走 FlareSolverr 时，cf_clearance 会自动追加在 browser.cookies 之上（同名覆盖）。
 
     一般在插件模块顶层调用（import 时执行），早于任何 fs() 调用。
     重复调用会覆盖；换了一个来源来覆盖时会打 warning，便于发现两个插件抢同一个单例。
@@ -123,6 +179,7 @@ def configure_site(
         user_agent=user_agent,
         source=source,
         use_fs=bool(enabled),
+        browser=_as_browser_profile(browser, impersonate=impersonate, cookies=cookies),
     )
     return _current_site
 
@@ -145,7 +202,11 @@ class DirectClient:
 
     与 FlareSolverr 通道的区别：
     - 没有 cf_clearance，遇到 Cloudflare 挑战页会直接拿到 403/503 的 HTML
-    - 请求头自己带 UA（站点通常要求 UA 非空），不带 cookie
+    - 请求头自己带 UA（站点通常要求 UA 非空）
+    - browser.cookies 照样会带（自填的 cf_clearance / 登录态同样有效）
+
+    浏览器指纹（browser.impersonate）在直连通道同样生效 —— 不少站点就算不弹
+    挑战页，也会在 TLS 层把脚本客户端挡掉，只有指纹像浏览器才拿得到 200。
     """
 
     def __init__(
@@ -157,32 +218,40 @@ class DirectClient:
         proxy: Optional[str] = None,
         follow_redirects: bool = True,
         verify: bool = True,
+        browser: Optional[BrowserProfile] = None,
+        cookie_hosts: tuple[str, ...] = (),     # Cookie 绑定域名，空则发给所有域名
         transport: Optional[httpx.AsyncBaseTransport] = None,  # 测试钩子：注入 MockTransport
     ) -> None:
+        self.browser = browser or BrowserProfile()
         self.user_agent = user_agent or DEFAULT_DIRECT_UA
         self.timeout = timeout
         self.extra_headers = dict(headers or {})
         self.proxy = proxy
         self.follow_redirects = follow_redirects
         self.verify = verify
+        self.cookie_hosts = tuple(h for h in cookie_hosts if h)
         self._transport = transport
-        self._client: Optional[httpx.AsyncClient] = None
+        self._client: Optional[Any] = None
 
     async def start(self) -> None:
         if self._client is not None:
             return
         headers = {
-            "User-Agent": self.user_agent,
+            "User-Agent": self.browser.effective_ua(self.user_agent),
             "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
+        headers.update(self.browser.headers)
         headers.update(self.extra_headers)
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(self.timeout, connect=10.0),
-            headers=headers,
-            proxy=self.proxy,
-            follow_redirects=self.follow_redirects,
+        self._client = create_client(
+            timeout=self.timeout,
+            proxy=self.proxy or self.browser.proxy or None,
             verify=self.verify,
+            follow_redirects=self.follow_redirects,
+            headers=headers,
+            cookies=dict(self.browser.cookies),
+            cookie_domains=self.cookie_hosts,   # 按域名绑定，别发给无关的 CDN / 第三方域
+            browser=self.browser,
             transport=self._transport,
         )
 
@@ -197,10 +266,9 @@ class DirectClient:
 
     async def aclose(self) -> None:
         client, self._client = self._client, None
-        if client is not None:
-            await client.aclose()
+        await aclose_client(client)
 
-    async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    async def request(self, method: str, url: str, **kwargs: Any) -> Any:
         if self._client is None:
             await self.start()
         assert self._client is not None
@@ -210,10 +278,10 @@ class DirectClient:
             headers.update(user_headers)
         return await self._client.request(method, url, headers=headers, **kwargs)
 
-    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+    async def get(self, url: str, **kwargs: Any) -> Any:
         return await self.request("GET", url, **kwargs)
 
-    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+    async def post(self, url: str, **kwargs: Any) -> Any:
         return await self.request("POST", url, **kwargs)
 
 
@@ -296,20 +364,24 @@ async def fs() -> AnyClient:
                 renew_margin=cfg.renew_margin,   # 过期前 N 秒就换
                 max_retries=cfg.max_retries,
                 concurrency=cfg.concurrency,
+                browser=site.browser,            # 指纹 + 自定义 Cookie
             )
         else:
             client = DirectClient(
                 user_agent=site.user_agent,      # 站点要求的合规 UA
                 timeout=cfg.request_timeout,
+                browser=site.browser,            # 直连也能带指纹和 Cookie
+                cookie_hosts=site.cookie_hosts,
             )
 
         await client.start()
         _client = client
         _client_site = site
         logger.info(
-            "取图客户端已启动（%s，站点=%s，来源=%s）",
+            "取图客户端已启动（%s，站点=%s，来源=%s，指纹=%s，自定义 Cookie %d 个）",
             "FlareSolverr" if site.use_fs else "直连",
             site.entry_url, site.source or "未知",
+            site.describe_browser(), len(site.browser.cookies),
         )
 
         # 预热必须放在锁内：否则并发调用者会拿到还没解出 cookie 的客户端
@@ -446,15 +518,20 @@ async def fs_health() -> dict[str, Any]:
         "started": _client.started if _client is not None else False,
         "site": site.entry_url if site else None,
         "session": (site.session_name if site else None) if mode == "flaresolverr" else None,
+        "impersonate": site.browser.impersonate if site else "",
+        "fingerprint_active": bool(site and site.browser.enabled),
     }
+    if site is not None and site.browser.cookies:
+        base["cookies"] = sorted(site.browser.cookies)      # 只报名字，不报值
     if mode != "flaresolverr" or _client is None or not _is_fs_client(_client):
-        return base                       # 直连：没有 cookie 可报
+        return base                       # 直连：没有 clearance 可报
 
     cl = _client.clearance
     base.update({
         "has_clearance": cl is not None,
         "alive": bool(cl and cl.alive),
         "expires_in": round(cl.expires_at - time.time(), 1) if cl else None,
-        "user_agent": cl.user_agent if cl else None,
+        "user_agent": _client.current_user_agent(),
+        "cookie_header": _client.current_cookie_header(),
     })
     return base
