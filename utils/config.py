@@ -146,6 +146,10 @@ class BotSettings:
     owner_ids: tuple[int, ...] = DEFAULT_OWNER_IDS
     log_level: str = "INFO"
     log_dir: str = "logs"
+    # 控制台日志是否按级别分流：INFO 及以下走 stdout，WARNING 及以上走 stderr。
+    # Docker / 1Panel 这类面板按 stdout、stderr 分栏，开着才能把「错误日志」留给真错误。
+    log_split_streams: bool = True
+    log_format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     flaresolverr: FlareSolverrSettings = field(default_factory=FlareSolverrSettings)
 
     @classmethod
@@ -156,6 +160,8 @@ class BotSettings:
             owner_ids=_as_tuple_int(owner_ids) or DEFAULT_OWNER_IDS,
             log_level=str(data.get("log_level", cls.log_level)).upper(),
             log_dir=str(data.get("log_dir", cls.log_dir)),
+            log_split_streams=bool(data.get("log_split_streams", cls.log_split_streams)),
+            log_format=str(data.get("log_format", cls.log_format)),
             flaresolverr=FlareSolverrSettings.from_mapping(data.get("flaresolverr")),
         )
 

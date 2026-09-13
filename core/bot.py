@@ -71,7 +71,12 @@ def init_plugin_configs() -> int:
 def run() -> None:
     """一键启动：初始化日志 -> 构建应用 -> 加载插件 -> 注册分发 -> 跑起来。"""
     config = load_config()  # 已加载过就直接复用缓存
-    setup_logging(config.log_level, config.log_dir)
+    setup_logging(
+        config.log_level,
+        config.log_dir,
+        split_streams=config.log_split_streams,
+        fmt=config.log_format,
+    )
 
     application = build_application()
     # 插件必须先于 Application 启动流程加载，startup 钩子才注册得上

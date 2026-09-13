@@ -15,6 +15,8 @@
   "owner_ids": [535840409],
   "log_level": "INFO",
   "log_dir": "logs",
+  "log_split_streams": true,
+  "log_format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 
   "flaresolverr": {
     "_comment": "这里只配 FlareSolverr 客户端本身的参数（怎么连、超时重试），一般不用改；站点相关的 user_agent 等由插件提供，见 config/yiff.json",
