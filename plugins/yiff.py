@@ -13,6 +13,13 @@ e621/e926 相关的**全部**参数都在这里 —— 站点地址、默认标�
 1. 先试 reply_photo  → 能预览，体验最好
 2. 失败则 reply_document → 支持任意格式
 3. 仍失败则自己下载字节再发 → 绕开 Telegram 侧下载被 e926 拒绝的情况
+
+取图通道开关（本插件独有，见 flaresolverr.enabled）：
+- true  走 FlareSolverr：先解 Cloudflare 挑战，带着 cf_clearance 访问
+- false 纯直连：普通 httpx 请求，只带 UA，不碰 FlareSolverr
+两种切法：
+- 改 config/yiff.json 的 flaresolverr.enabled，然后 /reload
+- 主人直接发 /fs on、/fs off，运行时立即生效并写回配置文件
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ from pathlib import PurePosixPath
 from typing import Optional
 
 from core import BotError, Context, Keyboard, button, listener, plugin_config, shutdown, startup
-from utils.fs_pool import configure_site, fs
+from utils.fs_pool import configure_site, fs, fs_health, set_mode
 from utils.posts_pool import PoolSettings, Post, get_pool, pool_start, pool_stop
 
 logger = logging.getLogger(__name__)
@@ -50,6 +57,8 @@ cfg = plugin_config({
     # 只有 UA 得自己填（e621/e926 禁止浏览器 UA，但挑战又必须由浏览器过）。
     # FlareSolverr 客户端本身的参数（地址、超时、重试）在主配置 config.json。
     "flaresolverr": {
+        "_comment": "enabled=false 时直连站点（不带 cf_clearance，也不连 FlareSolverr）；true 时走 FlareSolverr 解挑战。可用 /fs on|off 运行时切换",
+        "enabled": False,               # 取图通道开关：true=FlareSolverr，false=直连
         "user_agent": "MyTgBot/1.0 (by a08381 on e621)",
     },
 
@@ -61,19 +70,37 @@ cfg = plugin_config({
 })
 
 
-# 把站点信息交给 FlareSolverr 单例。必须在模块顶层执行：
+def _fs_cfg() -> dict:
+    """config/yiff.json 的 flaresolverr 段（副本，改它不会落盘）。"""
+    return dict(cfg.get("flaresolverr") or {})
+
+
+def _fs_enabled() -> bool:
+    """当前是否走 FlareSolverr（默认开）。"""
+    return bool(_fs_cfg().get("enabled", True))
+
+
+def _save_fs_enabled(enabled: bool) -> None:
+    """把开关写回 config/yiff.json，重启后依然是这个值。"""
+    merged = _fs_cfg()
+    merged["enabled"] = bool(enabled)
+    cfg.set("flaresolverr", merged)
+
+
+# 把站点信息交给取图客户端单例。必须在模块顶层执行：
 # 插件 import（load_all_plugins）早于 post_init，fs() 首次调用时参数已就位。
-# 改了 site 或 UA 后 /reload 即可 —— fs() 发现站点变了会重建客户端。
+# 改了 site / UA / enabled 后 /reload 即可 —— fs() 发现站点或通道变了会重建客户端。
 # entry_url / session_name 一般不用管，需要单独指定时往 config/yiff.json 的
 # flaresolverr 段里加这两个键即可（plugin_config 不会删掉多出来的字段）。
 def _configure_site() -> None:
-    fs_cfg = cfg.get("flaresolverr") or {}
+    fs_cfg = _fs_cfg()
     configure_site(
         cfg.get("site") or "",
         user_agent=fs_cfg.get("user_agent"),
         entry_url=fs_cfg.get("entry_url"),
         session_name=fs_cfg.get("session_name"),
         source="yiff",
+        enabled=_fs_enabled(),
     )
 
 
@@ -147,7 +174,7 @@ async def _send_media(ctx: Context, post: Post, markup: Keyboard) -> None:
     except BotError as e:
         logger.info("send_document 失败，改为自己下载: %s", e)
 
-    # 3) 自己下载字节上传（走带 cf_clearance 的单例，绕开 e926 对 Telegram 的拒绝）
+    # 3) 自己下载字节上传（走当前通道的客户端，绕开 e926 对 Telegram 的拒绝）
     client = await fs()
     resp = await client.get(post.file_url)
     resp.raise_for_status()
@@ -233,6 +260,70 @@ async def yiff_next(ctx: Context, key: str) -> None:
     except Exception:
         logger.exception("yiff_next 异常")
         await ctx.answer_query("出错了，请稍后再试", show_alert=True)
+
+
+# --------------------------------------------------------------------------
+# 取图通道开关：/fs on（FlareSolverr）| /fs off（直连）| /fs（看当前状态）
+#
+# 只改内存里的站点信息并重建客户端，图池不用重建 —— 它每次取图都 await fs()，
+# 下一个请求自动走新通道。开关同时写回 config/yiff.json，重启后保持。
+# --------------------------------------------------------------------------
+_FS_ON = {"on", "1", "true", "yes", "y", "enable", "open", "fs"}
+_FS_OFF = {"off", "0", "false", "no", "n", "disable", "close", "direct"}
+
+
+async def _status_text() -> str:
+    health = await fs_health()
+    fs_mode = health.get("mode") == "flaresolverr"
+    lines = [
+        f"当前取图通道：{'FlareSolverr' if fs_mode else '直连'}",
+        f"站点：{cfg.get('site')}",
+    ]
+    if fs_mode:
+        if health.get("has_clearance"):
+            lines.append(f"cf_clearance：有效（{health.get('expires_in')}s 后过期）")
+        else:
+            lines.append("cf_clearance：暂无，首次取图时会解挑战")
+    else:
+        lines.append(f"UA：{_fs_cfg().get('user_agent') or '（未配置，用默认）'}")
+    return "\n".join(lines)
+
+
+@listener("fs")
+@listener("yiff_fs")
+async def yiff_fs(ctx: Context, *args, **kwargs):
+    user = ctx.user
+    if user is None or not user.is_owner:
+        return                                     # 非主人静默忽略
+
+    arg = args[0].strip().lower() if args else ""
+    if not arg or arg in ("status", "state"):
+        await ctx.reply_text(await _status_text())
+        return
+
+    if arg in _FS_ON:
+        target = True
+    elif arg in _FS_OFF:
+        target = False
+    else:
+        await ctx.reply_text("用法：/fs on（走 FlareSolverr）| /fs off（直连）| /fs（看状态）")
+        return
+
+    if target == _fs_enabled():
+        await ctx.reply_text(f"已经是{'FlareSolverr' if target else '直连'}通道了")
+        return
+
+    _save_fs_enabled(target)
+    await set_mode(target)                         # 丢旧客户端 + 按新通道重建
+    if target:
+        await ctx.reply_text(
+            "已切到 FlareSolverr 通道，正在后台解挑战（首次取图可能稍慢）\n"
+            "已写入 config/yiff.json"
+        )
+    else:
+        await ctx.reply_text(
+            "已切到直连通道，不再经过 FlareSolverr\n已写入 config/yiff.json"
+        )
 
 
 # --------------------------------------------------------------------------

@@ -22,3 +22,13 @@ python main.py --init-config
 FlareSolverr 里跟站点绑定的三项不算基础设施，它们描述"访问哪个站"，由插件声明：
 `user_agent` 在 `yiff.json` 里；`entry_url` 默认就等于 `site`、`session_name` 默认取
 站点域名，都不用配（确有需要时手动往 `yiff.json` 的 flaresolverr 段加这两个键即可）。
+
+## 取图通道开关（yiff）
+
+`yiff.json` 的 `flaresolverr.enabled` 决定取图走哪条通道：
+
+- `true`：走 FlareSolverr 解 Cloudflare 挑战，带 `cf_clearance` 访问（默认）
+- `false`：纯直连，普通 httpx 请求只带 UA，不连 FlareSolverr
+
+改文件后 `/reload` 生效；也可以让主人发 `/fs on`、`/fs off` 运行时切换（会同时
+写回这个文件），`/fs` 不带参数查看当前通道状态。

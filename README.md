@@ -42,7 +42,7 @@ TeleBot/
 ├── utils/                  通用工具层 —— 只依赖标准库 + httpx，不依赖 core
 │   ├── config.py           主配置加载（全部参数带默认值）
 │   ├── async_flaresolverr.py  FlareSolverr 异步客户端
-│   ├── fs_pool.py          FlareSolverr 单例 + 后台保活
+│   ├── fs_pool.py          取图客户端单例（FlareSolverr / 直连）+ 后台保活
 │   └── posts_pool.py       帖子预热池
 └── plugins/                业务插件 —— 只 import core / utils
     ├── ping.py  reload.py  whoami.py  wm.py  yiff.py
@@ -190,7 +190,8 @@ cfg.reset()            # 恢复默认值
 | --- | --- |
 | `site` | 站点地址，如 `https://e926.net` / `https://e621.net` |
 | `default_tags` | 不带参数时的默认标签 |
-| `flaresolverr.user_agent` | 无头浏览器用的 UA（e621 禁浏览器 UA，需填合规 UA） |
+| `flaresolverr.enabled` | **取图通道开关**：`true` 走 FlareSolverr 解挑战，`false` 纯直连（默认 `true`） |
+| `flaresolverr.user_agent` | 无头浏览器用的 UA（e621 禁浏览器 UA，需填合规 UA）；直连时也是它 |
 | `pool.size` | 预热池容量 |
 | `pool.low_water` | 低于此数量开始补货 |
 | `pool.refill_interval` | 补货检查间隔（秒） |
@@ -217,6 +218,19 @@ cfg.reset()            # 恢复默认值
 
 `flaresolverr.user_agent` 改完 `/reload` 也能生效：`fs()` 发现站点信息变了会自动
 关掉旧 session、按新参数重建客户端。
+
+### 取图通道：FlareSolverr / 直连
+
+`flaresolverr.enabled` 决定 yiff 用哪条通道取图，两种切法都行：
+
+- 改 `config/yiff.json` 里的 `enabled`，然后 `/reload`
+- 主人直接发 `/fs on`（走 FlareSolverr）、`/fs off`（直连），**运行时立即生效**，
+  同时把开关写回 `config/yiff.json`，重启后保持；`/fs` 不带参数查看当前通道与
+  cf_clearance 状态
+
+通道切换只重建取图客户端，**图池不用重建** —— 它每次取图都现调 `fs()`，
+下一个请求自动走新通道。切走 FlareSolverr 时会 destroy 浏览器 session，
+切回来则在后台预热（解挑战可能要几十秒，不阻塞指令）。
 
 `entry_url`（触发挑战的入口页）默认就等于 `site`，`session_name` 默认取站点域名，
 **都不需要配**。只有 UA 必须自己填 —— 它是站点对爬虫的合规要求，没法从地址推出来。
