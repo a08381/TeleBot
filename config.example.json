@@ -1,0 +1,10 @@
+{
+  "t_token": "你的Telegram Bot Token",
+  "t_host": "https://api.telegram.org",
+  "webhook": {
+    "enable": true,
+    "url": "https://example.com",
+    "port": 7755,
+    "path": "/"
+  }
+}
