@@ -76,7 +76,7 @@ def _normalize_entry(url: str) -> str:
 
 def _derive_session(entry_url: str) -> str:
     """入口页 -> session 名。取域名（e926.net），没有域名就退回 default。"""
-    return urlparse(entry_url).hostname or "default"
+    return urlparse(entry_url).hostname.replace(".", "_") or "default"
 
 
 # ----------------------------------------------------------------- 站点注册

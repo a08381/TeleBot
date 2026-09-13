@@ -1,7 +1,5 @@
 # TeleBot
 
-a decorator-based python-telegram-bot handler。
-
 装饰器风格的 Telegram Bot 框架：插件只声明「我处理哪个指令」，
 框架负责解析、分发、生命周期管理；插件里看不到任何 `import telegram`。
 
