@@ -1,18 +1,29 @@
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, Bot
+from core import Context, Keyboard, listener, plugin_config
 
-from plugin import listener
+# 首次运行自动生成 config/wm.json
+cfg = plugin_config({
+    "prompt": "Please choose:",
+    "per_row": 2,             # 每行几个按钮
+    "options": [
+        {"text": "Option 1", "data": "1"},
+        {"text": "Option 2", "data": "2"},
+        {"text": "Option 3", "data": "3"},
+    ],
+})
 
 
 @listener("wm")
-async def wm(bot: Bot, update: Update, *args, **kwargs):
-    keyboard = [
-        [
-            InlineKeyboardButton("Option 1", callback_data="1"),
-            InlineKeyboardButton("Option 2", callback_data="2"),
-        ],
-        [InlineKeyboardButton("Option 3", callback_data="3")],
-    ]
+async def wm(ctx: Context, *args, **kwargs):
+    options = cfg.get("options") or []
+    if not options:
+        await ctx.reply_text("没有配置任何选项")
+        return
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    per_row = max(1, int(cfg.get("per_row") or 1))
+    keyboard = Keyboard()
+    for index, option in enumerate(options):
+        if index and index % per_row == 0:
+            keyboard.row()
+        keyboard.callback(option.get("text", ""), option.get("data", ""))
 
-    await update.message.reply_text("Please choose:", reply_markup=reply_markup)
+    await ctx.reply_text(cfg.get("prompt"), reply_markup=keyboard)

@@ -1,7 +1,11 @@
-"""
-帖子预热池：后台提前把图拉好，指令来了直接取，用户侧零网络往返。
+"""帖子预热池：后台提前把图拉好，指令来了直接取，用户侧零网络往返。
 
-依赖 fs_pool 提供的 FlareSolverr 单例。挂在 post_init 里启动。
+这是一个**通用组件**，本身不含任何站点信息：
+站点地址、标签、限流、池容量都由使用方（插件）通过 PoolSettings 注入，
+依赖的 FlareSolverr 单例由 utils.fs_pool 提供。
+
+以 yiff 插件为例：参数写在 config/yiff.json，插件在自己的 startup 钩子里
+调用 pool_start(PoolSettings.from_mapping(...)) 启动本池。
 """
 
 from __future__ import annotations
@@ -12,21 +16,40 @@ import random
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Optional
+from typing import Any, Deque, Mapping, Optional
 from urllib.parse import urlencode
 
-from fs_pool import fs
+from .fs_pool import fs
 
 logger = logging.getLogger(__name__)
 
-SITE = "https://e926.net"
-DEFAULT_TAGS = ["-intersex", "-female", "male", "order:rank"]
 
-POOL_SIZE = 40
-LOW_WATER = 10          # 池子低于此值就补货
-REFILL_INTERVAL = 30.0  # 补货检查间隔
-MIN_INTERVAL = 1.1      # e621 硬限 2 req/s，官方建议持续 <=1 req/s
-CACHE_TTL = 300.0
+@dataclass(frozen=True)
+class PoolSettings:
+    """图池参数。默认值适用于一般图站；e926/e621 的推荐值由插件配置给出。"""
+
+    site: str = ""
+    default_tags: tuple[str, ...] = ()
+    size: int = 40                 # 预热池容量
+    low_water: int = 10            # 低于此值就补货
+    refill_interval: float = 30.0  # 补货检查间隔（秒）
+    min_interval: float = 1.0      # 两次请求的最小间隔（站点限流）
+    cache_ttl: float = 300.0
+
+    @classmethod
+    def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "PoolSettings":
+        data = data or {}
+        defaults = cls()
+        tags = data.get("default_tags")
+        return cls(
+            site=str(data.get("site", defaults.site)).rstrip("/"),
+            default_tags=tuple(tags) if tags else defaults.default_tags,
+            size=int(data.get("size", defaults.size)),
+            low_water=int(data.get("low_water", defaults.low_water)),
+            refill_interval=float(data.get("refill_interval", defaults.refill_interval)),
+            min_interval=float(data.get("min_interval", defaults.min_interval)),
+            cache_ttl=float(data.get("cache_ttl", defaults.cache_ttl)),
+        )
 
 
 @dataclass
@@ -36,20 +59,24 @@ class Post:
     page_url: str
 
     @classmethod
-    def from_json(cls, raw: dict[str, Any]) -> Optional["Post"]:
+    def from_json(cls, raw: dict[str, Any], site: str = "") -> Optional["Post"]:
         try:
+            post_id = int(raw["id"])
             return cls(
-                id=int(raw["id"]),
+                id=post_id,
                 file_url=raw["file"]["url"],
-                page_url=f"{SITE}/posts/{raw['id']}",
+                page_url=f"{site}/posts/{post_id}",
             )
         except (KeyError, TypeError, ValueError):
             return None
 
 
 class PostPool:
-    def __init__(self) -> None:
-        self._pool: Deque[Post] = deque(maxlen=POOL_SIZE)
+    """把配置当参数收进来，自己不读任何配置文件。"""
+
+    def __init__(self, cfg: PoolSettings) -> None:
+        self._cfg = cfg
+        self._pool: Deque[Post] = deque(maxlen=cfg.size)
         self._cache: dict[str, tuple[float, list[Post]]] = {}
         self._throttle_lock = asyncio.Lock()
         self._last_at = 0.0
@@ -57,13 +84,18 @@ class PostPool:
         self._stop: Optional[asyncio.Event] = None
         self._closed = False
 
+    # ------------------------------------------------------------ 配置
+    @property
+    def settings(self) -> PoolSettings:
+        return self._cfg
+
     # ------------------------------------------------------------ 限流
     async def _throttle(self) -> None:
         async with self._throttle_lock:
             loop = asyncio.get_running_loop()
             delta = loop.time() - self._last_at
-            if delta < MIN_INTERVAL:
-                await asyncio.sleep(MIN_INTERVAL - delta)
+            if delta < self._cfg.min_interval:
+                await asyncio.sleep(self._cfg.min_interval - delta)
             self._last_at = loop.time()
 
     # ------------------------------------------------------------ 拉取
@@ -73,7 +105,7 @@ class PostPool:
         params: dict[str, Any] = {"tags": " ".join(tags), "limit": limit}
         if page:
             params["page"] = page
-        url = f"{SITE}/posts.json?{urlencode(params)}"
+        url = f"{self._cfg.site}/posts.json?{urlencode(params)}"
 
         await self._throttle()
         resp = await client.get(url)            # 自动带 cf_clearance + 固定 UA
@@ -85,14 +117,17 @@ class PostPool:
         except Exception:
             logger.warning("posts.json 不是合法 JSON（可能又出挑战页）")
             return []
-        return [p for p in (Post.from_json(r) for r in payload.get("posts", [])) if p]
+        return [
+            p for p in (Post.from_json(r, self._cfg.site) for r in payload.get("posts", []))
+            if p
+        ]
 
     async def search(self, tags: list[str]) -> list[Post]:
         """带缓存的搜索。"""
         key = " ".join(tags)
         now = time.monotonic()
         hit = self._cache.get(key)
-        if hit and now - hit[0] < CACHE_TTL:
+        if hit and now - hit[0] < self._cfg.cache_ttl:
             return hit[1]
         posts = await self._fetch(tags, limit=40, page=random.randint(1, 20))
         if not posts:
@@ -104,7 +139,7 @@ class PostPool:
     async def random_post(self, tags: list[str]) -> Optional[Post]:
         if not tags and self._pool:
             return self._pool.popleft()          # 命中预热池：零网络往返
-        posts = await self.search(tags or DEFAULT_TAGS)
+        posts = await self.search(tags or list(self._cfg.default_tags))
         if not posts:
             return None
         chosen = random.choice(posts)
@@ -119,7 +154,9 @@ class PostPool:
     # ------------------------------------------------------------ 补货
     async def _refill_once(self) -> int:
         try:
-            posts = await self._fetch(DEFAULT_TAGS, limit=40, page=random.randint(1, 30))
+            posts = await self._fetch(
+                list(self._cfg.default_tags), limit=40, page=random.randint(1, 30)
+            )
         except Exception as e:
             logger.warning("预热补货失败: %s", e)
             return 0
@@ -136,11 +173,11 @@ class PostPool:
         assert self._stop is not None
         while not self._closed:
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=REFILL_INTERVAL)
+                await asyncio.wait_for(self._stop.wait(), timeout=self._cfg.refill_interval)
                 return
             except asyncio.TimeoutError:
                 pass
-            if len(self._pool) < LOW_WATER:
+            if len(self._pool) < self._cfg.low_water:
                 try:
                     await self._refill_once()
                 except asyncio.CancelledError:
@@ -154,7 +191,7 @@ class PostPool:
         await self._refill_once()
         self._stop = asyncio.Event()
         self._task = asyncio.create_task(self._loop())
-        logger.info("帖子预热池已启动（当前 %d 张）", len(self._pool))
+        logger.info("帖子预热池已启动（%s，当前 %d 张）", self._cfg.site, len(self._pool))
 
     async def stop(self) -> None:
         self._closed = True
@@ -174,34 +211,42 @@ class PostPool:
 
 
 # ---------------------------------------------------------------- 单例
+# 池必须挂在模块级：plugins.* 会被 reload 清掉，实例放插件里热重载一次就没了
 _pool: Optional[PostPool] = None
-_pool_lock: Optional[asyncio.Lock] = None
+_started = False
 
 
-def _get_lock() -> asyncio.Lock:
-    global _pool_lock
-    if _pool_lock is None:
-        _pool_lock = asyncio.Lock()
-    return _pool_lock
-
-
-async def get_pool() -> PostPool:
-    global _pool
-    if _pool is not None:
-        return _pool
-    async with _get_lock():
-        if _pool is None:
-            _pool = PostPool()
+def get_pool() -> Optional[PostPool]:
+    """取当前图池；插件调用 start 之前为 None。"""
     return _pool
 
 
-async def pool_start(application: Any = None) -> None:
-    p = await get_pool()
-    await p.start()
+async def pool_start(cfg: PoolSettings, *, restart: bool = False) -> PostPool:
+    """用给定配置创建并启动图池。
 
+    :param cfg:      由插件配置构造的参数
+    :param restart:  True 时先停掉旧池再按新配置重建（改了站点/标签时用）
+    """
+    global _pool, _started
 
-async def pool_stop(application: Any = None) -> None:
-    global _pool
+    if _pool is not None and not restart:
+        if _started:
+            return _pool
+        await _pool.start()
+        _started = True
+        return _pool
+
     if _pool is not None:
         await _pool.stop()
-        _pool = None
+
+    _pool = PostPool(cfg)
+    await _pool.start()
+    _started = True
+    return _pool
+
+
+async def pool_stop() -> None:
+    global _started
+    if _pool is not None:
+        await _pool.stop()
+    _started = False

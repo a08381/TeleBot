@@ -1,0 +1,11 @@
+# Telegram Bot 框架
+python-telegram-bot>=21.0,<23.0
+
+# FlareSolverr 客户端 / HTTP
+httpx>=0.27,<1.0
+
+# 可选：本地自签 FlareSolverr 走 https 时需要
+# httpx[http2]>=0.27,<1.0
+
+# 说明：FlareSolverr 本身不是 Python 依赖，需要单独用 Docker 起服务
+#   docker run -d -p 8191:8191 flaresolverr/flaresolverr
