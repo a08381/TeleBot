@@ -11,10 +11,11 @@ cp config.example.json config.json   # 填好 t_token（owner_ids 建议改成�
 python main.py                       # 默认长轮询；webhook.enable=true 时走 webhook
 ```
 
-FlareSolverr 不是 pip 依赖，需要单独起：
+过 Cloudflare 不需要额外起服务：装 `curl_cffi` 后填 `browser.impersonate`，
+请求就会带上与真实浏览器一致的 TLS/HTTP2 指纹（详见下文「过 Cloudflare」）。
 
 ```bash
-docker run -d -p 8191:8191 flaresolverr/flaresolverr
+pip install curl_cffi
 ```
 
 ## 项目结构
@@ -37,18 +38,19 @@ TeleBot/
 │   ├── plugin_config.py    插件私有配置（config/<插件名>.json）
 │   ├── errors.py           BotError（对 SDK 异常的统一包装）
 │   └── logging_setup.py    日志（控制台 + 按天切分）
-├── utils/                  通用工具层 —— 只依赖标准库 + httpx，不依赖 core
+├── utils/                  通用工具层 —— 只依赖标准库 + httpx/curl_cffi，不依赖 core
 │   ├── config.py           主配置加载（全部参数带默认值）
-│   ├── async_flaresolverr.py  FlareSolverr 异步客户端
-│   ├── fs_pool.py          取图客户端单例（FlareSolverr / 直连）+ 后台保活
+│   ├── browser_profile.py  浏览器指纹 + Cookie 配置、客户端工厂
+│   ├── http_pool.py        取图客户端单例（带浏览器指纹）
 │   └── posts_pool.py       帖子预热池
 └── plugins/                业务插件 —— 只 import core / utils
     ├── ping.py  reload.py  whoami.py  wm.py  yiff.py
 ```
 
-**两级配置**：Bot 本体与基础设施（Token、API 地址、主人 ID、日志、webhook、FlareSolverr）
-在根目录 `config.json`；业务参数（e621/e926 站点、标签、图池、限流等）在 `config/yiff.json`，
-由插件声明默认值后自动生成 —— 主配置里没有一行图站相关的内容。
+**两级配置**：Bot 本体与基础设施（Token、API 地址、主人 ID、日志、webhook）
+在根目录 `config.json`；业务参数（e621/e926 站点、UA、标签、图池、限流，以及浏览器
+指纹与 Cookie）在 `config/yiff.json`，由插件声明默认值后自动生成 ——
+主配置里没有一行图站相关的内容。
 
 依赖方向单向：`plugins → core → utils`，utils 不反向依赖任何东西。
 
@@ -87,7 +89,7 @@ async def demo(ctx: Context, payload: str):
 ### 插件自己的资源（startup / shutdown 钩子）
 
 插件要随进程启停的资源（连接池、后台任务），用钩子声明，框架在
-`post_init` / `post_shutdown` 阶段统一调用（FlareSolverr 之后启动、之前停止）：
+`post_init` / `post_shutdown` 阶段统一调用（取图客户端之后启动、之前停止）：
 
 ```python
 from core import shutdown, startup
@@ -140,7 +142,7 @@ cfg.reset()            # 恢复默认值
 ## 热重载
 
 `/reload`（仅 `owner_ids` 里的用户可用）会清空注册表、卸载 `plugins.*` 模块并重新导入。
-因此**跨重载需要保留的单例要放 `utils/`**（`fs_pool` / `posts_pool` 就是这么做的），
+因此**跨重载需要保留的单例要放 `utils/`**（`http_pool` / `posts_pool` 就是这么做的），
 插件模块级的缓存会随重载一起重置。
 
 ## 配置
@@ -156,8 +158,7 @@ cfg.reset()            # 恢复默认值
   },
   "owner_ids": [535840409],
   "log_level": "INFO",
-  "log_dir": "logs",
-  "flaresolverr": { ... }
+  "log_dir": "logs"
 }
 ```
 
@@ -167,19 +168,6 @@ cfg.reset()            # 恢复默认值
 旧格式的顶层 `t_token` / `t_host` / `webhook` 仍能读，自动兜底（telegram 段优先），
 迁移时不用一次性改完。
 
-主配置里的 `flaresolverr` 段只保留「客户端本身怎么工作」的参数，
-站点相关的三项由插件提供（见下）：
-
-| 字段 | 含义 | 什么时候才需要改 |
-| --- | --- | --- |
-| `url` | FlareSolverr 服务地址 | 服务不在本机 8191 时 |
-| `fs_timeout` | 调 FlareSolverr 的超时 | 挑战特别慢、频繁超时时调大（默认 120s，不建议调小） |
-| `request_timeout` | 拿到 cookie 后直连目标站的超时 | 目标站响应慢时调大 |
-| `renew_margin` | cookie 还剩多少秒过期时提前续 | 想更早/更晚续期时 |
-| `max_retries` | 遇到 403/503 判定为挑战后重解重试几次 | 想让它多试几次时调大 |
-| `concurrency` | 直连目标站的并发上限 | 想放宽/收紧并发时 |
-| `refresh_interval` | 后台保活多久检查一次 cookie | 想让续期检查更频繁时 |
-
 这些都是通用调参，**默认即可**，看不懂就不用动。
 
 `config/yiff.json`（e621/e926 全部参数，运行时自动生成）：
@@ -188,12 +176,12 @@ cfg.reset()            # 恢复默认值
 | --- | --- |
 | `site` | 站点地址，如 `https://e926.net` / `https://e621.net` |
 | `default_tags` | 不带参数时的默认标签 |
-| `flaresolverr.enabled` | **取图通道开关**：`true` 走 FlareSolverr 解挑战，`false` 纯直连（默认 `true`） |
-| `flaresolverr.user_agent` | 无头浏览器用的 UA（e621 禁浏览器 UA，需填合规 UA）；直连时也是它 |
+| `user_agent` | 站点要求的合规 UA（e621 禁浏览器 UA，需带用户名） |
 | `browser.impersonate` | **浏览器指纹**：`chrome124` / `chrome` / `firefox135` / `safari184`…，留空=不启用 |
+| `browser.sync_ua` | 启用指纹时，用浏览器 UA 覆盖上面的 `user_agent`（默认 `true`） |
 | `browser.cookies` / `browser.cookie` | 站点 Cookie：dict 或 `"a=1; b=2"` 字符串（登录态、手填的 cf_clearance） |
-| `browser.sync_ua` | 启用指纹时把指纹 UA 同步给 FlareSolverr 与请求头（默认 `true`） |
 | `browser.cookie_domains` | 额外要发 Cookie 的域名（图片在 CDN 子域时填它） |
+| `browser.timeout` | 单次请求超时（秒，默认 20） |
 | `pool.size` | 预热池容量 |
 | `pool.low_water` | 低于此数量开始补货 |
 | `pool.refill_interval` | 补货检查间隔（秒） |
@@ -218,49 +206,41 @@ cfg.reset()            # 恢复默认值
 改完插件配置执行 `/reload` 即可生效；唯一例外是 `site` 与 `pool.*` ——
 图池在进程启动时按这些参数建好了，改它们需要重启进程。
 
-`flaresolverr.user_agent` 改完 `/reload` 也能生效：`fs()` 发现站点信息变了会自动
-关掉旧 session、按新参数重建客户端。
+`user_agent` 与 `browser.*` 改完 `/reload` 也能生效：`http()` 发现站点或浏览器身份
+变了会自动关掉旧客户端、按新参数重建。
 
-### 取图通道：FlareSolverr / 直连
+### 过 Cloudflare：浏览器指纹 + Cookie
 
-`flaresolverr.enabled` 决定 yiff 用哪条通道取图，两种切法都行：
+Cloudflare 看两样东西：**TLS/HTTP2 指纹** 与 **Cookie**。前者是硬门槛 ——
+httpx 的握手形状一看就是脚本，还没轮到看 Cookie 就被 403 了。所以：
 
-- 改 `config/yiff.json` 里的 `enabled`，然后 `/reload`
-- 主人直接发 `/fs on`（走 FlareSolverr）、`/fs off`（直连），**运行时立即生效**，
-  同时把开关写回 `config/yiff.json`，重启后保持；`/fs` 不带参数查看当前通道与
-  cf_clearance 状态
+```bash
+pip install curl_cffi
+```
 
-通道切换只重建取图客户端，**图池不用重建** —— 它每次取图都现调 `fs()`，
-下一个请求自动走新通道。切走 FlareSolverr 时会 destroy 浏览器 session，
-切回来则在后台预热（解挑战可能要几十秒，不阻塞指令）。
-
-### 浏览器指纹 + 自定义 Cookie
-
-光有 `cf_clearance` 还不够：Cloudflare 同时看 TLS / HTTP2 指纹，httpx 的握手
-形状一看就是脚本，照样 403。要真正"像浏览器"，装 `curl_cffi` 并在
-`config/yiff.json` 里配 `browser` 段：
+然后在 `config/yiff.json` 里配 `browser` 段：
 
 ```jsonc
 "browser": {
   "impersonate": "chrome124",          // 留空=不启用指纹
-  "sync_ua": true,                     // 指纹 UA 同步给无头浏览器（cf_clearance 与 UA 绑定）
+  "sync_ua": true,                     // 用浏览器 UA 覆盖站点 UA（CF 会交叉验证两者）
   "cookies": { "login": "xxx" },       // 站点 Cookie，或 "cookie": "a=1; b=2"
   "cookie_domains": [],                // 额外要发 Cookie 的域名（CDN 子域）
-  "headers": {}
+  "headers": {},
+  "timeout": 20.0
 }
 ```
 
-- 两条通道（FlareSolverr / 直连）都支持，装没装 curl_cffi 都能跑：没装时自动退回
-  httpx 并打一条 warning，功能不受影响，只是没指纹
+- 装没装 curl_cffi 都能跑：没装时自动退回 httpx 并打一条 warning，功能不受影响，
+  只是没有指纹（`/fp` 会显示"未生效"）
 - Cookie 只发给站点主域 + `cookie_domains`，不会泄漏给 CDN / 第三方域
-- **注意冲突**：e621/e926 要求 UA 带用户名且不许用浏览器 UA，而开了指纹就得用
-  浏览器 UA，二选一（见 `config/README.md` 的说明）
+- 改完 `/reload` 生效，图池不用重建 —— 它每次取图都现调 `http()`
+- **注意冲突**：e621/e926 要求 UA 带用户名且不许用浏览器 UA，而过 CF 必须用浏览器
+  UA，二选一（见 `config/README.md`）
 
-详见 `config/README.md`。
+> **为什么放在插件配置**：`site` / `user_agent` / 浏览器身份描述的都是
+> 「访问哪个站、以什么身份」，同一个进程里可能有多个插件访问不同站点，
+> 所以它们跟着插件走，主配置只留 Bot 本体那几项。
 
-`entry_url`（触发挑战的入口页）默认就等于 `site`，`session_name` 默认取站点域名，
-**都不需要配**。只有 UA 必须自己填 —— 它是站点对爬虫的合规要求，没法从地址推出来。
+`/fp`（仅主人）可以随时查看当前指纹、Cookie 名与实际发出的 UA。
 
-> **为什么这么分**：`site` / `entry_url` / `session_name` / `user_agent` 描述的是
-> 「要访问哪个站」——同一个 FlareSolverr 服务可能先后被不同插件用来访问不同站点，
-> 所以它们跟着插件走；超时、重试、并发是客户端自身行为，跟站点无关，留在主配置。

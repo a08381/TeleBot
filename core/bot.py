@@ -3,9 +3,9 @@
 这里是整个项目唯一 touch python-telegram-bot 入口逻辑的地方。
 
 生命周期顺序：
-    启动：FlareSolverr 就绪（fs_start） -> 插件 startup 钩子（如启动图池）
-    停止：插件 shutdown 钩子          -> FlareSolverr 关闭（fs_stop）
-图池依赖 FlareSolverr，所以必须「后启动、先停止」。
+    启动：取图客户端就绪（http_start） -> 插件 startup 钩子（如启动图池）
+    停止：插件 shutdown 钩子           -> 取图客户端关闭（http_stop）
+图池依赖取图客户端，所以必须「后启动、先停止」。
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from telegram import Update
 from telegram.ext import Application, ApplicationBuilder
 
 from utils.config import get_config, load_config
-from utils.fs_pool import fs_start, fs_stop
+from utils.http_pool import http_start, http_stop
 from utils.plugin_config import all_plugin_configs
 
 from .dispatcher import register_handlers
@@ -29,13 +29,13 @@ logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------- 生命周期
 async def _on_startup(application: Application) -> None:
-    await fs_start()        # 1) 浏览器 + 挑战预热
+    await http_start()               # 1) 取图客户端（带浏览器指纹）
     await run_startup(application)   # 2) 插件自己的资源（图池等）
 
 
 async def _on_shutdown(application: Application) -> None:
     await run_shutdown(application)  # 1) 先停插件资源
-    await fs_stop()                  # 2) 再关浏览器
+    await http_stop()                # 2) 再关取图客户端
 
 
 # --------------------------------------------------------------------- 构建

@@ -2,7 +2,7 @@
 
 这是一个**通用组件**，本身不含任何站点信息：
 站点地址、标签、限流、池容量都由使用方（插件）通过 PoolSettings 注入，
-依赖的 FlareSolverr 单例由 utils.fs_pool 提供。
+依赖的带指纹 HTTP 客户端由 utils.http_pool 提供。
 
 以 yiff 插件为例：参数写在 config/yiff.json，插件在自己的 startup 钩子里
 调用 pool_start(PoolSettings.from_mapping(...)) 启动本池。
@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Deque, Mapping, Optional
 from urllib.parse import urlencode
 
-from .fs_pool import fs
+from .http_pool import http
 
 logger = logging.getLogger(__name__)
 
@@ -101,21 +101,21 @@ class PostPool:
     # ------------------------------------------------------------ 拉取
     async def _fetch(self, tags: list[str], limit: int = 40,
                      page: Optional[int] = None) -> list[Post]:
-        client = await fs()                     # 复用同一个 FlareSolverr 单例
+        client = await http()                   # 复用全局唯一的取图客户端
         params: dict[str, Any] = {"tags": " ".join(tags), "limit": limit}
         if page:
             params["page"] = page
         url = f"{self._cfg.site}/posts.json?{urlencode(params)}"
 
         await self._throttle()
-        resp = await client.get(url)            # 自动带 cf_clearance + 固定 UA
+        resp = await client.get(url)            # 自动带浏览器指纹、Cookie 与 UA
         if resp.status_code != 200:
             logger.warning("posts.json 返回 %s", resp.status_code)
             return []
         try:
             payload = resp.json()
         except Exception:
-            logger.warning("posts.json 不是合法 JSON（可能又出挑战页）")
+            logger.warning("posts.json 不是合法 JSON（可能被 Cloudflare 拦截）")
             return []
         return [
             p for p in (Post.from_json(r, self._cfg.site) for r in payload.get("posts", []))

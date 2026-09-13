@@ -2,7 +2,7 @@
 
 分层约定：
     core/    —— 框架层，**唯一**允许 import python-telegram-bot 的地方
-    utils/   —— 通用工具层，只依赖标准库 + httpx
+    utils/   —— 通用工具层，只依赖标准库 + httpx / curl_cffi
     plugins/ —— 业务插件，只 import core（以及需要时的 utils），不碰 telegram
 
 插件作者能拿到的东西都在 core 的导出里：

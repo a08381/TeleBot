@@ -2,7 +2,7 @@
 
 reload 时会清掉注册表和 sys.modules 里的 plugins.*，再重新 import，
 所以插件里的模块级状态（比如缓存字典）会一起重置 —— 这是有意为之。
-需要跨 reload 保留的单例请放 utils/ 下（例如 fs_pool / posts_pool）。
+需要跨 reload 保留的单例请放 utils/ 下（例如 http_pool / posts_pool）。
 """
 
 from __future__ import annotations

@@ -15,9 +15,9 @@
         await pool_stop()
 
 调用顺序（重要）：
-    启动: FlareSolverr 就绪 -> 插件 startup
-    停止: 插件 shutdown     -> FlareSolverr 关闭
-即池子依赖的浏览器要后停，所以插件钩子在 FS 之前结束。
+    启动: 取图客户端就绪 -> 插件 startup
+    停止: 插件 shutdown  -> 取图客户端关闭
+即池子依赖的取图客户端要后停，所以插件钩子在它之前结束。
 
 钩子只在进程启动时执行一次；/reload 会重新注册，但不会重复触发。
 """
@@ -37,14 +37,14 @@ _shutdowns: List[Hook] = []
 
 
 def startup(func: Hook) -> Hook:
-    """注册启动钩子（post_init 阶段，FlareSolverr 之后）。"""
+    """注册启动钩子（post_init 阶段，取图客户端之后）。"""
     if func not in _startups:
         _startups.append(func)
     return func
 
 
 def shutdown(func: Hook) -> Hook:
-    """注册停止钩子（post_shutdown 阶段，FlareSolverr 之前）。"""
+    """注册停止钩子（post_shutdown 阶段，取图客户端之前）。"""
     if func not in _shutdowns:
         _shutdowns.append(func)
     return func

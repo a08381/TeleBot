@@ -16,16 +16,5 @@
   "log_level": "INFO",
   "log_dir": "logs",
   "log_split_streams": true,
-  "log_format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-
-  "flaresolverr": {
-    "_comment": "这里只配 FlareSolverr 客户端本身的参数（怎么连、超时重试），一般不用改；站点相关的 user_agent 等由插件提供，见 config/yiff.json",
-    "url": "http://localhost:8191/v1",
-    "refresh_interval": 60.0,
-    "fs_timeout": 120.0,
-    "request_timeout": 20.0,
-    "renew_margin": 300.0,
-    "max_retries": 1,
-    "concurrency": 4
-  }
+  "log_format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 }

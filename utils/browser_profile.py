@@ -3,45 +3,44 @@
 为什么需要它
 ------------
 httpx 只管发 HTTP 请求，它的 TLS 握手（JA3/JA4）与 HTTP/2 帧顺序是
-**Python 客户端的形状**。Cloudflare 即使不看 Cookie，也能凭这两项把请求
-判成脚本；`cf_clearance` 也只认「解挑战时的那台浏览器」——UA、IP、指纹
-三者对不上，cookie 立刻失效，返回 403/503。
+**Python 客户端的形状**。Cloudflare 早在看 Cookie 之前就能凭这两项把请求
+判成脚本，直接 403。
 
 所以过 CF 需要两件事同时成立：
-1. **Cookie**：cf_clearance（FlareSolverr 解出）+ 用户自填的站点 Cookie（登录态等）
-2. **指纹**：TLS / HTTP2 / 头顺序跟真实浏览器一致 —— 这部分由 curl_cffi 提供
+1. **指纹**：TLS / HTTP2 / 头顺序跟真实浏览器一致 —— 由 curl_cffi 提供
+2. **Cookie**：站点 Cookie（登录态、手填的 cf_clearance…），自己从浏览器粘过来
 
 本模块只负责"描述指纹和 Cookie 长什么样"以及"按描述造一个客户端"，
-不含任何站点信息，站点相关的东西由 fs_pool.SiteProfile 带进来。
+不含任何站点信息，站点相关的东西由 http_pool.SiteProfile 带进来。
 
 浏览器指纹（curl_cffi）
 ----------------------
 ``pip install curl_cffi`` 后配置里填 ``impersonate`` 即可（chrome124 / firefox135 /
 safari184 …），TLS 指纹、HTTP/2 帧、头顺序一整套跟着走。**没装 curl_cffi 时
-自动退回 httpx**，行为与改动前完全一致，不会报错 —— 只是没有指纹。
+自动退回 httpx**，行为与无指纹时完全一致，不会报错。
 
 UA 一致性（关键）
 ----------------
 开启指纹后，UA 必须换成对应浏览器的 UA，否则"指纹是 Chrome、UA 写着
-MyTgBot/1.0"会更可疑。麻烦在于：cf_clearance 是跟 UA 绑定的，换 UA 等于
-让 cookie 作废。所以本模块在``sync_ua=True``（默认）时做一件事：
-**让 FlareSolverr 解挑战用的 UA == 直连请求用的 UA == 指纹对应的 UA**。
+MyTgBot/1.0"反而更可疑（CF 会拿 UA 与 TLS 指纹交叉验证）。所以
+``sync_ua=True``（默认）时会把请求 UA 替换成指纹对应的浏览器 UA。
 
 注意 e621/e926 这类站要求"UA 里带用户名、且不许用浏览器 UA"，与上面的
 要求直接冲突。要用哪个你自己权衡：
-- 站点没拦 IP、只是偶发挑战 -> 关掉 impersonate，保留合规 UA
-- CF 已经把你挡在门外      -> 开 impersonate + sync_ua，牺牲站点的 UA 合规
+- 站点没拦你、只是偶发拦截 -> 关掉 impersonate，保留合规 UA（sync_ua 就无所谓了）
+- CF 已经把你挡在门外      -> 开 impersonate，牺牲站点的 UA 合规换通过率
 
 配置示例（config/yiff.json 的 browser 段）::
 
     "browser": {
       "impersonate": "chrome124",          // 留空 = 不启用指纹（退回 httpx）
-      "sync_ua": true,                     // 把指纹 UA 同步给 FlareSolverr 与请求头
+      "sync_ua": true,                     // 启用指纹时，用浏览器 UA 覆盖站点 UA
       "user_agent": "",                    // 手动指定 UA 时优先（自己保证与指纹一致）
       "cookies": {"cf_clearance": "xxx"},  // 或 "cookie": "a=1; b=2" 字符串二选一
       "cookie_domains": [],                // 额外要发 cookie 的域名（默认只有站点主域）
       "headers": {"Referer": "https://e621.net/"},
-      "proxy": "",                         // 与 FlareSolverr 出网 IP 保持一致
+      "proxy": "",
+      "timeout": 20.0,
       "verify": true
     }
 """
@@ -205,12 +204,13 @@ class BrowserProfile:
     """
 
     impersonate: str = ""                                   # chrome124 / firefox135 / safari184 ...
-    sync_ua: bool = True                                    # 把指纹 UA 同步给 FlareSolverr 与请求头
+    sync_ua: bool = True                                    # 启用指纹时，用浏览器 UA 覆盖站点 UA
     user_agent: str = ""                                    # 手动指定 UA（优先于自动推导）
     cookies: Mapping[str, str] = field(default_factory=dict)  # 静态 Cookie（合并 cookies + cookie 字符串）
     cookie_domains: tuple[str, ...] = ()                    # 额外要发 Cookie 的域名
     headers: Mapping[str, str] = field(default_factory=dict)  # 附加请求头
-    proxy: str = ""                                         # 留空则用客户端自带的代理设置
+    proxy: str = ""                                         # 留空则直连（不带代理）
+    timeout: float = 20.0                                   # 单次请求超时（秒）
     verify: bool = True                                     # 自签证书场景可关（不建议）
     ja3: str = ""                                           # 进阶：自定义 JA3（通常不需要）
     akamai: str = ""                                        # 进阶：自定义 Akamai H2 指纹
@@ -239,6 +239,7 @@ class BrowserProfile:
             cookie_domains=tuple(str(d).strip().lstrip(".") for d in domains if str(d).strip()),
             headers={str(k): str(v) for k, v in headers.items()} if isinstance(headers, Mapping) else {},
             proxy=str(data.get("proxy") or "").strip(),
+            timeout=float(data.get("timeout") or 20.0),
             verify=bool(data.get("verify", True)),
             ja3=str(data.get("ja3") or "").strip(),
             akamai=str(data.get("akamai") or "").strip(),
@@ -247,8 +248,12 @@ class BrowserProfile:
     # ------------------------------------------------------------ 查询
     @property
     def enabled(self) -> bool:
-        """是否启用浏览器指纹。没装 curl_cffi 时即使填了也视为未启用。"""
-        return bool(self.impersonate) and CURL_CFFI_AVAILABLE
+        """是否真的启用了指纹：填了 impersonate **且** curl_cffi 可用。
+
+        用 ``_CffiAsyncSession is not None`` 判定而不是布尔开关，
+        免得两者不一致时造出一个根本发不出去请求的客户端。
+        """
+        return bool(self.impersonate) and _CffiAsyncSession is not None
 
     @property
     def wants_fingerprint(self) -> bool:
@@ -264,11 +269,14 @@ class BrowserProfile:
     def effective_ua(self, fallback: str = "") -> str:
         """最终请求用的 UA。
 
-        优先级：手动 user_agent > 指纹 UA（sync_ua 时）> 传入的站点 UA。
+        优先级：手动 user_agent > 指纹 UA（sync_ua 且指纹真的生效）> 传入的站点 UA。
+
+        只有在指纹**真的生效**时才替换：没装 curl_cffi 却把 UA 写成 Chrome，等于
+        "UA 是浏览器、TLS 指纹是 Python"，比不换更容易被识破。
         """
         if self.user_agent:
             return self.user_agent
-        if self.sync_ua:
+        if self.sync_ua and self.enabled:
             ua = self.impersonate_ua()
             if ua:
                 return ua
@@ -345,7 +353,7 @@ def create_client(
         _seed_cookies(client, cookies, cookie_domains)
         return client
 
-    if browser.enabled:
+    if browser.enabled and _CffiAsyncSession is not None:
         kwargs: dict[str, Any] = {
             "impersonate": browser.impersonate,
             "timeout": timeout,

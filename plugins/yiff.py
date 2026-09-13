@@ -1,8 +1,8 @@
 """plugins/yiff.py —— 发送带内联按钮的图片。
 
 本插件独占一份配置：config/yiff.json（首次加载自动生成）。
-e621/e926 相关的**全部**参数都在这里 —— 站点地址、默认标签、限流、图池容量……
-主配置 config.json 里只剩下 FlareSolverr 那段（它属于浏览器基础设施，不是图站业务）。
+e621/e926 相关的**全部**参数都在这里 —— 站点地址、UA、默认标签、限流、图池容量，
+以及过 Cloudflare 用的浏览器指纹与 Cookie；主配置 config.json 只管 Bot 本体。
 
 按钮分两类：
 - 「原图链接 / 帖子页」是 URL 按钮，纯跳转，不产生 callback
@@ -14,17 +14,10 @@ e621/e926 相关的**全部**参数都在这里 —— 站点地址、默认标�
 2. 失败则 reply_document → 支持任意格式
 3. 仍失败则自己下载字节再发 → 绕开 Telegram 侧下载被 e926 拒绝的情况
 
-取图通道开关（本插件独有，见 flaresolverr.enabled）：
-- true  走 FlareSolverr：先解 Cloudflare 挑战，带着 cf_clearance 访问
-- false 纯直连：普通 httpx 请求，只带 UA，不碰 FlareSolverr
-两种切法：
-- 改 config/yiff.json 的 flaresolverr.enabled，然后 /reload
-- 主人直接发 /fs on、/fs off，运行时立即生效并写回配置文件
-
-过 CF 还需要「浏览器指纹」（config/yiff.json 的 browser 段）：
-cf_clearance 只证明"有人用浏览器解过挑战"，CF 同时还在看 TLS/HTTP2 指纹，
-httpx 的握手一看就是脚本。填 browser.impersonate（chrome124 等）后请求会由
-curl_cffi 发出，指纹与真实浏览器一致；自定义 Cookie 也在这段里配。
+过 Cloudflare 靠「浏览器指纹 + Cookie」（config/yiff.json 的 browser 段）：
+CF 先看 TLS/HTTP2 指纹，httpx 的握手一看就是脚本，直接 403。填
+browser.impersonate（chrome124 等）后请求由 curl_cffi 发出，指纹与真浏览器一致；
+站点 Cookie（登录态、手填的 cf_clearance）也在这一段配。
 没装 curl_cffi 时自动退回 httpx，日志会提示，功能本身不受影响。
 """
 
@@ -38,7 +31,7 @@ from typing import Optional
 
 from core import BotError, Context, Keyboard, button, listener, plugin_config, shutdown, startup
 from utils.browser_profile import BrowserProfile
-from utils.fs_pool import configure_site, fs, fs_health, set_mode
+from utils.http_pool import configure_site, http, http_health
 from utils.posts_pool import PoolSettings, Post, get_pool, pool_start, pool_stop
 
 logger = logging.getLogger(__name__)
@@ -59,31 +52,25 @@ cfg = plugin_config({
         "cache_ttl": 300.0,        # 搜索结果缓存时长（秒）
     },
 
-    # ---- 过 Cloudflare 挑战 ----
-    # entry_url / session_name 不需要配：默认拿上面的 site，session 名取站点域名。
-    # 只有 UA 得自己填（e621/e926 禁止浏览器 UA，但挑战又必须由浏览器过）。
-    # FlareSolverr 客户端本身的参数（地址、超时、重试）在主配置 config.json。
-    "flaresolverr": {
-        "_comment": "enabled=false 时直连站点（不带 cf_clearance，也不连 FlareSolverr）；true 时走 FlareSolverr 解挑战。可用 /fs on|off 运行时切换",
-        "enabled": False,               # 取图通道开关：true=FlareSolverr，false=直连
-        "user_agent": "MyTgBot/1.0 (by a08381 on e621)",
-    },
+    # ---- 站点 UA ----
+    # e621/e926 要求 UA 非空、带用户名，且不许用浏览器 UA；但过 CF 又必须用
+    # 浏览器 UA —— 两者冲突，看你更需要哪个（见下面 browser.impersonate）。
+    "user_agent": "MyTgBot/1.0 (by a08381 on e621)",
 
-    # ---- 浏览器指纹 + 自定义 Cookie ----
-    # cf_clearance 只能证明「解挑战的那台浏览器」，CF 还会看 TLS/HTTP2 指纹：
-    # httpx 的握手形状一看就是脚本，所以想稳过 CF 得让请求也像浏览器。
-    # impersonate 填 chrome124 / chrome / firefox135 / safari184 等即启用
-    # （依赖 pip install curl_cffi，没装就自动退回 httpx，不会报错）。
+    # ---- 浏览器指纹 + Cookie（过 Cloudflare 全靠这一段） ----
+    # CF 先看 TLS/HTTP2 指纹：httpx 的握手一看就是脚本，直接 403。
+    # 填 impersonate 后请求由 curl_cffi 发出，指纹与真浏览器一致。
     "browser": {
-        "_comment": "impersonate 留空=不启用指纹；启用后 UA 会自动换成对应浏览器的 UA（cf_clearance 与 UA 绑定，必须一致）。cookies/cookie 二选一，写站点 Cookie（登录态、手填的 cf_clearance 等）",
-        "impersonate": "",              # 浏览器指纹：chrome124 / firefox135 / safari184 ...
-        "sync_ua": True,                # 启用指纹时，把指纹 UA 同步给 FlareSolverr 与请求头
+        "_comment": "impersonate 留空=不启用指纹（依赖 pip install curl_cffi，没装就自动退回 httpx）。cookies/cookie 二选一，写站点 Cookie（登录态、手填的 cf_clearance 等）",
+        "impersonate": "",              # 浏览器指纹：chrome124 / chrome / firefox135 / safari184 ...
+        "sync_ua": True,                # 启用指纹时，用浏览器 UA 覆盖上面的 user_agent
         "user_agent": "",               # 手动指定 UA（优先于自动推导，自己保证与指纹一致）
         "cookies": {},                  # {"cf_clearance": "xxx", "login": "yyy"}
         "cookie": "",                   # 或直接贴字符串："a=1; b=2"
         "cookie_domains": [],           # 额外要发 Cookie 的域名（图片在 CDN 子域时填它）
         "headers": {},                  # 附加请求头，如 {"Referer": "https://e621.net/"}
-        "proxy": "",                    # 留空则用 FlareSolverr 通道的代理设置
+        "proxy": "",                    # 留空则直连
+        "timeout": 20.0,                # 单次请求超时（秒）
         "verify": True,                 # 关掉可跳过证书校验（自签/中间人时用，不建议）
     },
 
@@ -95,39 +82,16 @@ cfg = plugin_config({
 })
 
 
-def _fs_cfg() -> dict:
-    """config/yiff.json 的 flaresolverr 段（副本，改它不会落盘）。"""
-    return dict(cfg.get("flaresolverr") or {})
-
-
-def _fs_enabled() -> bool:
-    """当前是否走 FlareSolverr（默认开）。"""
-    return bool(_fs_cfg().get("enabled", True))
-
-
-def _save_fs_enabled(enabled: bool) -> None:
-    """把开关写回 config/yiff.json，重启后依然是这个值。"""
-    merged = _fs_cfg()
-    merged["enabled"] = bool(enabled)
-    cfg.set("flaresolverr", merged)
-
-
 # 把站点信息交给取图客户端单例。必须在模块顶层执行：
-# 插件 import（load_all_plugins）早于 post_init，fs() 首次调用时参数已就位。
-# 改了 site / UA / enabled / browser 后 /reload 即可 —— fs() 发现站点、通道或
-# 浏览器身份变了会重建客户端。
-# entry_url / session_name 一般不用管，需要单独指定时往 config/yiff.json 的
-# flaresolverr 段里加这两个键即可（plugin_config 不会删掉多出来的字段）。
+# 插件 import（load_all_plugins）早于 post_init，http() 首次调用时参数已就位。
+# 改了 site / user_agent / browser 后 /reload 即可 —— http() 发现站点或浏览器
+# 身份变了会重建客户端。
 def _configure_site() -> None:
-    fs_cfg = _fs_cfg()
     configure_site(
         cfg.get("site") or "",
-        user_agent=fs_cfg.get("user_agent"),
-        entry_url=fs_cfg.get("entry_url"),
-        session_name=fs_cfg.get("session_name"),
+        user_agent=cfg.get("user_agent"),
         source="yiff",
-        enabled=_fs_enabled(),
-        browser=cfg.get("browser"),     # 浏览器指纹 + 自定义 Cookie
+        browser=cfg.get("browser"),     # 浏览器指纹 + Cookie
     )
 
 
@@ -202,7 +166,7 @@ async def _send_media(ctx: Context, post: Post, markup: Keyboard) -> None:
         logger.info("send_document 失败，改为自己下载: %s", e)
 
     # 3) 自己下载字节上传（走当前通道的客户端，绕开 e926 对 Telegram 的拒绝）
-    client = await fs()
+    client = await http()
     resp = await client.get(post.file_url)
     resp.raise_for_status()
     data = resp.content
@@ -290,22 +254,20 @@ async def yiff_next(ctx: Context, key: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# 取图通道开关：/fs on（FlareSolverr）| /fs off（直连）| /fs（看当前状态）
+# 浏览器身份诊断：/fp（看当前指纹、Cookie、实际 UA）
 #
-# 只改内存里的站点信息并重建客户端，图池不用重建 —— 它每次取图都 await fs()，
-# 下一个请求自动走新通道。开关同时写回 config/yiff.json，重启后保持。
+# 只做展示，不改任何东西 —— 想换指纹/UA/Cookie 就改 config/yiff.json 再 /reload，
+# http() 发现浏览器身份变了会自动重建客户端。
 # --------------------------------------------------------------------------
-_FS_ON = {"on", "1", "true", "yes", "y", "enable", "open", "fs"}
-_FS_OFF = {"off", "0", "false", "no", "n", "disable", "close", "direct"}
-
-
 async def _status_text() -> str:
-    health = await fs_health()
-    fs_mode = health.get("mode") == "flaresolverr"
-    lines = [
-        f"当前取图通道：{'FlareSolverr' if fs_mode else '直连'}",
-        f"站点：{cfg.get('site')}",
-    ]
+    # 先让单例按当前配置对齐（改了 browser 但还没取过图时，客户端仍是旧的）
+    try:
+        await http()
+    except Exception as e:
+        logger.info("取图客户端尚未就绪: %s", e)
+    health = http_health()
+    site = cfg.get("site")
+    lines = [f"站点：{site}"]
 
     # 浏览器指纹：装了 curl_cffi 且填了 impersonate 才真的生效
     fp = health.get("impersonate") or ""
@@ -315,57 +277,25 @@ async def _status_text() -> str:
         lines.append(f"浏览器指纹：{fp}（已生效）")
     else:
         lines.append(f"浏览器指纹：{fp}（未生效，缺 curl_cffi）")
+
     if health.get("cookies"):
         lines.append(f"自定义 Cookie：{', '.join(health['cookies'])}")
 
-    if fs_mode:
-        if health.get("has_clearance"):
-            lines.append(f"cf_clearance：有效（{health.get('expires_in')}s 后过期）")
-        else:
-            lines.append("cf_clearance：暂无，首次取图时会解挑战")
-
-    # 实际发出的 UA：开了指纹会被换成浏览器 UA，这里显示的是替换之后的值
+    # 实际发出的 UA：开了指纹会被换成浏览器 UA，这里显示替换之后的值
     browser = BrowserProfile.from_mapping(cfg.get("browser") or {})
-    ua = health.get("user_agent") or browser.effective_ua(_fs_cfg().get("user_agent") or "")
+    ua = health.get("user_agent") or browser.effective_ua(cfg.get("user_agent") or "")
     lines.append(f"UA：{ua or '（未配置，用默认）'}")
+    lines.append(f"客户端已启动：{'是' if health.get('started') else '否（首次取图时创建）'}")
     return "\n".join(lines)
 
 
-@listener("fs")
-@listener("yiff_fs")
-async def yiff_fs(ctx: Context, *args, **kwargs):
+@listener("fp")
+@listener("yiff_fp")
+async def yiff_fp(ctx: Context, *args, **kwargs):
     user = ctx.user
     if user is None or not user.is_owner:
         return                                     # 非主人静默忽略
-
-    arg = args[0].strip().lower() if args else ""
-    if not arg or arg in ("status", "state"):
-        await ctx.reply_text(await _status_text())
-        return
-
-    if arg in _FS_ON:
-        target = True
-    elif arg in _FS_OFF:
-        target = False
-    else:
-        await ctx.reply_text("用法：/fs on（走 FlareSolverr）| /fs off（直连）| /fs（看状态）")
-        return
-
-    if target == _fs_enabled():
-        await ctx.reply_text(f"已经是{'FlareSolverr' if target else '直连'}通道了")
-        return
-
-    _save_fs_enabled(target)
-    await set_mode(target)                         # 丢旧客户端 + 按新通道重建
-    if target:
-        await ctx.reply_text(
-            "已切到 FlareSolverr 通道，正在后台解挑战（首次取图可能稍慢）\n"
-            "已写入 config/yiff.json"
-        )
-    else:
-        await ctx.reply_text(
-            "已切到直连通道，不再经过 FlareSolverr\n已写入 config/yiff.json"
-        )
+    await ctx.reply_text(await _status_text())
 
 
 # --------------------------------------------------------------------------
