@@ -128,6 +128,19 @@ class BotSettings:
             log_format=str(data.get("log_format", cls.log_format)),
         )
 
+    # ------------------------------------------------------------ 便捷访问
+    @property
+    def token(self) -> str:
+        return self.telegram.token
+
+    @property
+    def host(self) -> str:
+        return self.telegram.host
+
+    @property
+    def webhook(self) -> WebhookSettings:
+        return self.telegram.webhook
+
 
 _config: Optional[BotSettings] = None
 
