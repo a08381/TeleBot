@@ -96,12 +96,12 @@ def match_button(data: str) -> Tuple[List[Callable], Tuple[str, ...]]:
 
 
 # --------------------------------------------------------------------- 分发
-async def _run_all(funcs: List[Callable], ctx: Context, *args: Any) -> None:
+async def _run_all(funcs: List[Callable], ctx: Context, *args: Any, **kwargs: Any) -> None:
     """并发调用所有处理函数；单个插件出错不影响其它插件，也不向上抛。"""
     if not funcs:
         return
     results = await asyncio.gather(
-        *(func(ctx, *args) for func in funcs), return_exceptions=True
+        *(func(ctx, *args, **kwargs) for func in funcs), return_exceptions=True
     )
     for func, result in zip(funcs, results):
         if isinstance(result, BaseException):
