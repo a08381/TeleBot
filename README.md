@@ -42,7 +42,9 @@ TeleBot/
 │   ├── config.py           主配置加载（全部参数带默认值）
 │   ├── browser_profile.py  浏览器指纹 + Cookie 配置、客户端工厂
 │   ├── http_pool.py        取图客户端单例（带浏览器指纹）
-│   └── posts_pool.py       帖子预热池
+│   ├── posts_pool.py       帖子预热池
+│   ├── wm_api.py           Warframe Market 客户端单例（鉴权 / 限流 / v1+v2 回退）
+│   └── wm_items.py         WM 物品索引与「黑话」解析
 └── plugins/                业务插件 —— 只 import core / utils
     ├── ping.py  reload.py  whoami.py  wm.py  yiff.py
 ```
@@ -243,4 +245,104 @@ pip install curl_cffi
 > 所以它们跟着插件走，主配置只留 Bot 本体那几项。
 
 `/fp`（仅主人）可以随时查看当前指纹、Cookie 名与实际发出的 UA。
+
+## Warframe Market 插件（wm）
+
+登录 WM 账号、改在线状态、查物品价格（支持玩家黑话）。
+
+**一个 Telegram user id 绑定一个 WM 账号**：A 改状态不会动到 B 的账号，
+会话按 user id 分开存在 `config/wm_sessions.json`（权限 0600）。
+
+```text
+/wm                                 面板：自己绑定的账号 + 状态按钮
+/wm online|ingame|invisible          改**自己**账号的状态
+/wmstatus [状态]                     查看 / 改自己账号的状态
+/wmlogin [邮箱 密码]                  绑定（不带参数 = 主人用 config/wm.json 里的账号）
+/wmlogout [tg用户id]                 解绑（不带参数 = 解绑自己；带 id 需主人权限）
+/wmwho                              查看已绑定了哪些账号（主人看全部，其他人只看自己）
+/price <物品> [platform=ps4] [crossplay=true] [rank=5]
+/wmrefresh                           强制刷新物品清单（主人）
+/wmdiag                              逐个试探端点，看接口现状（主人）
+```
+
+黑话例子：
+
+```text
+/price 满级充沛          -> Arcane Energize，只统计 rank 5
+/price 咖喱p             -> Excalibur Prime Set
+/price 咖喱p 图纸         -> Excalibur Prime Blueprint
+/price 电男p 机体         -> Volt Prime Chassis
+/price nikana prime set platform=xbox crossplay=true
+```
+
+解析顺序：**官方中英文名**（物品清单自带 i18n，中文官方名天然命中）→
+**黑话词典**（`config/wm.json` 的 `aliases`）→ **关键字模糊匹配**（多个候选时给按钮让你选，
+不替你猜唯一解）。黑话词典只放官方名解释不了的昵称，可自行增删：
+
+```jsonc
+"aliases": {
+  "咖喱": "excalibur",     // 值是不带 _prime / _set 的**物品基名**
+  "充沛": "arcane_energize"
+}
+```
+
+自动识别的后缀：`p` / `prime` / `圣装` → `_prime`；`套装` / `set` → `_set`；
+`图纸` / `bp` → `_blueprint`；机体 / 系统 / 神经光元 / 刀刃 / 枪管… → 对应 part。
+等级支持 `满级`、`r3`、`3级`、`rank=3`；Mod / Arcane 不指定等级时会按等级分组列出。
+
+### 配置（config/wm.json）
+
+| 字段 | 说明 |
+| --- | --- |
+| `account.email` / `account.password` | 主人的 WM 账号；**建议填这里**，别在聊天里打密码 |
+| `account.user_id` | 主人账号绑到哪个 tg 用户；`0` = 自动取 `owner_ids` 第一个 |
+| `autologin` | 启动时自动把上面的账号绑过去（该用户已绑过则跳过） |
+| `bind.allow_all` | 是否允许普通用户绑定**自己**的账号（默认 `true`；`false` = 只有主人能绑） |
+| `bind.owner_can_unbind_all` | 主人能否 `/wmlogout <tg用户id>` 解绑别人（默认 `true`） |
+| `platform` / `crossplay` / `language` | 订单口径，默认 `pc` / `false` / `en` |
+| `user_agent` | 官方 Rules 要求必须能标识你的应用 |
+| `browser.*` | 被 Cloudflare 拦时填 `impersonate`（需 `pip install curl_cffi`）与 Cookie |
+| `rate_limit.rps` | 官方公共限流 **3 RPS**，别调高（多账号共享同一个桶） |
+| `cache.items_ttl` / `orders_ttl` | 物品清单 24h、订单 60s（官方要求必须缓存） |
+| `status_write.mode` | `auto`（先 v2 再 v1）/ `v2` / `v1` / `off` |
+| `price.only_online` | 只统计 online / ingame 的挂单（默认 `true`） |
+| `price.group_by_rank` | Mod / Arcane 未指定等级时按等级分组 |
+| `session_file` | 会话库：`{tg用户id -> 账号}`，含 JWT，权限 0600 |
+
+多账号模型（为什么这样设计）：
+
+```text
+WMClient（单例：连接池 + 限流器 + 公开数据缓存）
+  └── SessionStore: {tg_user_id -> WMSession}
+```
+
+客户端自己**不持有**任何账号状态，所有需要登录的接口都必须显式传 `session`。
+这样不会出现"单例里最后一个 token 覆盖所有人"的经典坑 ——
+每个指令按**发起者**（按钮则按点击者）取自己的账号。
+公开数据（清单 / 订单 / 统计）全局共享缓存，不区分账号。
+
+### 状态语义与「为什么写入不保证成功」
+
+官方 FAQ：`ingame` 可交易，`online` 约 1 小时内可交易，`invisible` 不可交易；
+`offline` 是断线后的自动状态，所以不提供手动设置。
+
+官方 v2 文档**没有公开在线状态写入端点**，v1 的 `PUT /profile/status` 属于社区沿用。
+插件因此做「双路径探测 + 回读校验」：先 `PATCH /v2/me`，失败再 `PUT /v1/profile/status`，
+写完都用 `GET /v2/me` 复核 —— 一致才回「状态已更新」，否则明说
+「请求已接受，但状态未确认」，**不假装成功**。装好后先跑 `/wmdiag` 看当前哪条路通。
+
+### API 现状（重要）
+
+WM 的新 API 合同仍 **< 1.0，随时可能破坏性变更**，官方明确 v1 已弃用但 OAuth 2.0 未开放、
+需要授权的集成仍要走 v1 授权流程。所以这里是「v1 登录 + v2 读数据 + 状态写入双路径」：
+
+| 用途 | 端点 |
+| --- | --- |
+| 登录 | `POST /v1/auth/signin`（凭证从响应头 `Authorization: JWT ...` 取） |
+| 当前用户 | `GET /v2/me` |
+| 订单 | `GET /v2/orders/item/{slug}`（公开，无需登录） |
+| 物品清单 | `GET /v1/items`，失败回退 `/v2/items` |
+| 历史统计 | `GET /v1/items/{slug}/statistics`（可选，挂了就自动省略） |
+
+`/wmdiag`（仅主人）会逐个试探这些端点并打印结果 —— 接口变了先看它。
 
