@@ -149,13 +149,11 @@ class CallbackQuery:
 class Context:
     """一次更新（消息 / 回调）的上下文，插件唯一的操作入口。"""
 
-    __slots__ = ("_bot", "_update", "args", "kwargs")
+    __slots__ = ("_bot", "_update")
 
-    def __init__(self, bot: Bot, update: Update, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, bot: Bot, update: Update) -> None:
         self._bot = bot
         self._update = update
-        self.args = args
-        self.kwargs = kwargs
 
     # ------------------------------------------------------------ 逃生舱
     # 极少情况下插件需要原始对象（例如用 PTB 的高级特性），走这两个属性。
@@ -334,4 +332,4 @@ class Context:
             await query.answer(text, show_alert=show_alert)
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
-        return f"Context(chat_id={self.chat_id}, args={self.args}, kwargs={self.kwargs})"
+        return f"Context(chat_id={self.chat_id})"

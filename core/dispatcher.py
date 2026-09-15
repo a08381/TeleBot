@@ -127,7 +127,7 @@ async def dispatch_command(update: Update, context: CallbackContext) -> None:
     if not funcs:
         return
     logger.debug("command %s has been called.", command)
-    await _run_all(funcs, Context(context.bot, update, *args, **kwargs))
+    await _run_all(funcs, Context(context.bot, update), *args, **kwargs)
 
 
 async def dispatch_callback(update: Update, context: CallbackContext) -> None:
