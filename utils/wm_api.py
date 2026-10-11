@@ -28,14 +28,14 @@ e621，wm 要访问 api.warframe.market 且带 JWT —— 站点与身份都不�
 API 现状（2026-09，合同版本仍 < 1.0，随时可能变）
 ------------------------------------------------
 官方文档明确：v1 已弃用，但 OAuth 2.0 尚未开放，**需要用户授权的集成仍然要
-走 v1 授权流程**。所以这里是「v1 拿凭证 + v2 读数据 + 状态写入双路径探测」：
+走 v1 授权流程**。所以这里是「v1 拿凭证 + v2 读数据 + WebSocket 写状态」：
 
     登录        POST  /v1/auth/signin      （社区强一致；官方说 v1 仍用于授权）
     当前用户    GET   /v2/me               （官方已文档化）
     订单        GET   /v2/orders/item/{slug}   （官方已文档化，公开无需登录）
     物品清单    GET   /v1/items            （回退 /v2/items）
     历史统计    GET   /v1/items/{slug}/statistics （社区一致，可选功能）
-    状态写入    PATCH /v2/me  →  回退 PUT /v1/profile/status （官方未确认，故做成探测）
+    状态写入    WebSocket /socket-v2（认证后发状态事件；offline 时断开连接）
 
 官方 Rules 要求：全局 **3 RPS**、User-Agent 必须可识别、必须缓存响应 ——
 这里用令牌桶 + 清单/订单缓存来满足。
@@ -48,9 +48,13 @@ import json
 import logging
 import os
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
+
+import websockets
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .browser_profile import BrowserProfile, aclose_client, create_client
 
@@ -58,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 V1_BASE = "https://api.warframe.market/v1"
 V2_BASE = "https://api.warframe.market/v2"
+STATUS_SOCKET_URL = "wss://warframe.market/socket-v2"
 STATIC_BASE = "https://warframe.market/static/assets/"
 ITEM_PAGE = "https://warframe.market/items/{slug}"
 
@@ -65,7 +70,7 @@ DEFAULT_UA = "TeleBot-WM/1.0 (+https://github.com/a08381/TeleBot)"
 
 PLATFORMS = ("pc", "ps4", "xbox", "switch", "mobile")
 STATUSES = ("invisible", "offline", "online", "ingame")
-SETTABLE_STATUSES = ("invisible", "online", "ingame")
+SETTABLE_STATUSES = ("invisible", "online", "ingame", "offline")
 ONLINE_STATUSES = ("online", "ingame")
 
 STATUS_LABEL = {
@@ -441,6 +446,8 @@ class WMClient:
         self._items_cache: Optional[list[dict]] = None
         self._items_ts = 0.0
         self._orders_cache: dict[str, tuple[float, list[dict]]] = {}
+        self._status_sockets: dict[int, Any] = {}
+        self._status_lock = asyncio.Lock()
 
     # ------------------------------------------------------------ 底层
     def _base_headers(self) -> dict[str, str]:
@@ -633,6 +640,9 @@ class WMClient:
             status = int(getattr(resp, "status_code", 0) or 0)
             token = self._extract_token(resp, body)
             if status < 400 and token:
+                previous = self.session_for(tg_user_id)
+                if previous.logged_in:
+                    await self._close_status_socket(tg_user_id)
                 session = WMSession(
                     tg_user_id=tg_user_id, token=token, email=email,
                     platform=self.platform, bound_at=time.time(),
@@ -685,6 +695,11 @@ class WMClient:
         """解绑（顺便通知 WM 端退出；失败也照样清本地）。"""
         if not session or not session.tg_user_id:
             return False
+        try:
+            await self._close_status_socket(session.tg_user_id)
+        except WMError as exc:
+            logger.warning("关闭 WM 状态 WebSocket 失败（继续清理本地会话）: %s", exc)
+            self._status_sockets.pop(session.tg_user_id, None)
         if session.logged_in:
             try:
                 await self._request("POST", f"{self.v1_base}/auth/signout", session=session)
@@ -726,68 +741,159 @@ class WMClient:
         self,
         status: str,
         session: Optional[WMSession] = None,
-        *,
-        mode: str = "auto",
-        verify: bool = True,
     ) -> dict:
-        """设置**某个账号**的在线状态。
-
-        官方文档只确认了 profile 的 PATCH，**没有公开状态写入端点**，所以这里是
-        「探测 + 回读校验」：先试 v2，再试 v1，写完都用 GET /v2/me 复核，
-        复核不一致就如实告诉用户「请求已接受，但状态未确认」。
-        """
+        """通过 WM 状态 WebSocket 设置某个账号的状态；offline 由断开连接实现。"""
         status = (status or "").strip().lower()
+        if status == "in_game":
+            status = "ingame"
         if status not in SETTABLE_STATUSES:
             raise WMError(
-                f"状态只能是 {' / '.join(SETTABLE_STATUSES)}（offline 是断开后的自动状态，不提供手动设置）",
+                f"状态只能是 {' / '.join(SETTABLE_STATUSES)}",
                 kind="config",
             )
+        if session is None or not session.logged_in:
+            raise WMError("该用户还没有绑定 Warframe Market 账号，先 /wmlogin", kind="auth")
 
-        order = {"v2": ("v2",), "v1": ("v1",), "auto": ("v2", "v1"), "off": ()}.get(
-            (mode or "auto").lower(), ("v2", "v1")
-        )
-        if not order:
-            raise WMError("状态写入已关闭（status_write.mode = off）", kind="config")
+        async with self._status_lock:
+            if status == "offline":
+                await self._close_status_socket(session.tg_user_id, locked=True)
+                session.status = "offline"
+                session.touch()
+                self.store.put(session)
+                return {
+                    "requested": status,
+                    "via": "websocket-disconnect",
+                    "verified": "offline",
+                    "confirmed": True,
+                    "errors": [],
+                }
 
-        errors: list[str] = []
-        used: Optional[str] = None
-        for name in order:
+            socket = self._status_sockets.get(session.tg_user_id)
+            if socket is None:
+                socket = await self._open_status_socket(session)
             try:
-                if name == "v2":
-                    await self.call(
-                        "PATCH", f"{self.v2_base}/me", session=session, v2=True,
-                        headers={"Content-Type": "application/json"}, json={"status": status},
-                    )
-                else:
-                    await self.call(
-                        "PUT", f"{self.v1_base}/profile/status", session=session, v2=False,
-                        headers={"Content-Type": "application/json"}, json={"status": status},
-                    )
-                used = name
-                break
-            except WMError as exc:
-                errors.append(f"{name}: {exc}")
-                if exc.kind == "auth":
+                await self._send_status(socket, status)
+            except ConnectionClosed:
+                self._status_sockets.pop(session.tg_user_id, None)
+                socket = await self._open_status_socket(session)
+                try:
+                    await self._send_status(socket, status)
+                except WMError:
                     raise
+                except (WebSocketException, OSError) as exc:
+                    self._status_sockets.pop(session.tg_user_id, None)
+                    raise WMError(f"状态 WebSocket 通信失败：{exc}", kind="network") from exc
+            except WMError:
+                raise
+            except (WebSocketException, OSError) as exc:
+                self._status_sockets.pop(session.tg_user_id, None)
+                raise WMError(f"状态 WebSocket 通信失败：{exc}", kind="network") from exc
 
-        if used is None:
-            raise WMError("状态写入失败（" + "；".join(errors) + "）", kind="api")
+            session.status = status
+            session.touch()
+            self.store.put(session)
+            return {
+                "requested": status,
+                "via": "websocket",
+                "verified": status,
+                "confirmed": True,
+                "errors": [],
+            }
 
-        verified: Optional[str] = None
-        if verify:
+    async def _open_status_socket(self, session: WMSession) -> Any:
+        try:
+            socket = await websockets.connect(
+                STATUS_SOCKET_URL,
+                subprotocols=["wfm"],
+                user_agent_header=self.browser.effective_ua(self.user_agent),
+                open_timeout=self.timeout,
+                close_timeout=min(self.timeout, 5.0),
+                ping_interval=20,
+                ping_timeout=20,
+            )
+        except (WebSocketException, OSError, asyncio.TimeoutError) as exc:
+            raise WMError(f"连接 WM 状态 WebSocket 失败：{exc}", kind="network") from exc
+
+        try:
+            await socket.send(json.dumps({
+                "route": "@wfm|cmd/auth/signIn",
+                "id": uuid.uuid4().hex,
+                "payload": {"token": session.token, "deviceId": "telebot"},
+            }))
+            await self._wait_for_socket_reply(socket, "@wfm|cmd/auth/signIn")
+        except WMError:
             try:
-                me = await self.get_me(session)
-                verified = str(me.get("status") or "") or None
-            except WMError as exc:
-                errors.append(f"回读校验失败: {exc}")
+                await socket.close()
+            except (WebSocketException, OSError, asyncio.TimeoutError) as exc:
+                logger.warning("清理未认证的 WM 状态 WebSocket 失败: %s", exc)
+            raise
+        except (WebSocketException, OSError, asyncio.TimeoutError) as exc:
+            try:
+                await socket.close()
+            except (WebSocketException, OSError, asyncio.TimeoutError) as close_exc:
+                logger.warning("清理未认证的 WM 状态 WebSocket 失败: %s", close_exc)
+            raise WMError(f"WM 状态 WebSocket 认证失败：{exc}", kind="network") from exc
 
-        return {
-            "requested": status,
-            "via": used,
-            "verified": verified,
-            "confirmed": verified is not None and verified.lower() == status,
-            "errors": errors,
-        }
+        self._status_sockets[session.tg_user_id] = socket
+        return socket
+
+    async def _send_status(self, socket: Any, status: str) -> None:
+        await socket.send(json.dumps({
+            "route": "@wfm|cmd/status/set",
+            "id": uuid.uuid4().hex,
+            "payload": {"status": "in_game" if status == "ingame" else status, "activity": None},
+        }))
+        await self._wait_for_socket_reply(socket, "@wfm|cmd/status/set")
+
+    async def _wait_for_socket_reply(self, socket: Any, route: str) -> Any:
+        deadline = time.monotonic() + self.timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WMError(f"等待 WM WebSocket 响应超时：{route}", kind="network")
+            try:
+                message = await asyncio.wait_for(socket.recv(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise WMError(f"等待 WM WebSocket 响应超时：{route}", kind="network") from exc
+            if isinstance(message, bytes):
+                try:
+                    message = message.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+            try:
+                data = json.loads(message)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            response_route = data.get("route")
+            if response_route == f"{route}:ok":
+                return data.get("payload")
+            if response_route == f"{route}:error":
+                payload = data.get("payload")
+                detail = (
+                    payload.get("error") or payload.get("message")
+                    if isinstance(payload, dict) else None
+                )
+                kind = "auth" if route.endswith("auth/signIn") else "api"
+                raise WMError(
+                    f"WM WebSocket 拒绝请求：{detail or route}",
+                    kind=kind,
+                )
+
+    async def _close_status_socket(self, tg_user_id: int, *, locked: bool = False) -> None:
+        if not locked:
+            async with self._status_lock:
+                await self._close_status_socket(tg_user_id, locked=True)
+            return
+        socket = self._status_sockets.get(tg_user_id)
+        if socket is None:
+            return
+        try:
+            await socket.close(code=1000, reason="offline")
+        except (WebSocketException, OSError, asyncio.TimeoutError) as exc:
+            raise WMError(f"关闭 WM 状态 WebSocket 失败：{exc}", kind="network") from exc
+        self._status_sockets.pop(tg_user_id, None)
 
     # ------------------------------------------------------------ 物品清单
     async def get_items(self, *, force: bool = False) -> list[dict]:
@@ -906,17 +1012,23 @@ class WMClient:
         await run(f"v1/items/{slug}/statistics（公开）", self.get_statistics(slug))
         if session is not None and session.logged_in:
             await run("v2/me（需登录）", self.get_me(session))
-            await run("PATCH v2/me（状态写入）", self.set_status("online", session, mode="v2"))
-            await run("PUT v1/profile/status（状态写入）", self.set_status("online", session, mode="v1"))
+            await run("WebSocket /socket-v2（状态写入）", self.set_status("online", session))
         else:
             checks.append(("v2/me（需登录）", False, "当前用户未绑定账号，跳过"))
         return checks
 
     # ------------------------------------------------------------ 生命周期
     async def aclose(self) -> None:
-        self.store.save()
-        client, self._client = self._client, None
-        await aclose_client(client)
+        async with self._status_lock:
+            self.store.save()
+            sockets, self._status_sockets = self._status_sockets, {}
+            for socket in sockets.values():
+                try:
+                    await socket.close(code=1000, reason="client shutdown")
+                except (WebSocketException, OSError, asyncio.TimeoutError) as exc:
+                    logger.warning("关闭 WM 状态 WebSocket 失败: %s", exc)
+            client, self._client = self._client, None
+            await aclose_client(client)
 
 
 # --------------------------------------------------------------------- 单例

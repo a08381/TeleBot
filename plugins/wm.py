@@ -6,7 +6,7 @@
 指令
 ----
     /wm                     面板：自己绑定的账号 + 状态按钮
-    /wm online|ingame|invisible      直接改**自己**账号的状态
+    /wm online|ingame|invisible|offline 直接改**自己**账号的状态
     /wmstatus [状态]        查看 / 改自己账号的状态
     /wmlogin [邮箱 密码]     绑定（不带参数 = 主人用 config/wm.json 里的账号）
     /wmlogout [tg用户id]     解绑（不带参数 = 解绑自己；带 id 需主人权限）
@@ -23,15 +23,11 @@
     /price nikana prime set platform=xbox crossplay=true
     /price 充沛 rank=3
 
-为什么状态写入是「探测 + 回读」
-------------------------------
-官方 v2 文档只确认了 profile 的 PATCH，**没公开在线状态写入端点**，而 v1 的
-``PUT /profile/status`` 属于社区沿用。所以这里两条路都试，写完再用
-``GET /v2/me`` 复核；复核不一致就如实说「请求已接受，但状态未确认」，
-绝不假装成功。文档没写死的东西，代码也不该写死。
+状态通过 WM 的 ``/socket-v2`` WebSocket 设置。活动状态需要保持连接；
+选择 offline 时关闭对应账号的 WebSocket。
 
 状态语义（官方 FAQ）：ingame=可交易，online=约 1 小时内可交易，invisible=不可交易；
-offline 是断线后的自动状态，所以不提供手动设置。
+offline 通过断开连接设置。
 """
 
 from __future__ import annotations
@@ -105,7 +101,7 @@ cfg = plugin_config({
 
     # ---- 接口 ----
     "api": {
-        "v1_base": V1_BASE,     # v1 仅用于登录与状态写入（官方说授权仍走 v1）
+        "v1_base": V1_BASE,     # v1 用于登录（官方说授权仍走 v1）
         "v2_base": V2_BASE,
         "timeout": 20.0,
         "auth_scheme": "auto",  # auto（v1 用 JWT、v2 用 Bearer）/ bearer / jwt
@@ -114,12 +110,6 @@ cfg = plugin_config({
     "cache": {"items_ttl": 86400.0, "orders_ttl": 60.0},
     "session_file": "config/wm_sessions.json",  # 会话库：tg id -> 账号（含 JWT，权限 0600）
     "warm_items": True,          # 启动时预热物品清单（查黑话要用）
-
-    # ---- 状态写入 ----
-    "status_write": {
-        "mode": "auto",         # auto（先 v2 再 v1）/ v2 / v1 / off
-        "verify": True,         # 写完用 GET /v2/me 复核
-    },
 
     # ---- 查价 ----
     "price": {
@@ -137,38 +127,92 @@ cfg = plugin_config({
     "aliases": {
         "_comment": "黑话 -> 物品基名。可自行增删；值要写英文名去掉后缀的形式，例如 excalibur / arcane_energize",
 
-        # 战甲
-        "咖喱": "excalibur", "咖喱棒": "excalibur",
-        "电男": "volt", "电王": "volt",
-        "奶妈": "trinity", "奶": "trinity",
-        "犀牛": "rhino", "牛": "rhino",
-        "摸尸": "nekros", "摸": "nekros",
-        "玻璃": "gara",
-        "女枪": "mesa",
-        "蝴蝶": "titania",
-        "鸟姐": "zephyr", "鸟": "zephyr",
-        "火鸡": "ember", "火女": "ember",
-        "毒妈": "saryn", "毒": "saryn",
-        "沙王": "inaros", "沙甲": "inaros", "沙": "inaros",
-        "阴阳": "equinox", "阴阳人": "equinox",
-        "冰男": "frost", "冰": "frost",
-        "水男": "hydroid", "水": "hydroid",
-        "悟空": "wukong", "猴": "wukong", "猴子": "wukong",
-        "磁力": "mag",
+        # 战甲（同一基名的别名放在一起）
+        "阿屎": "ash", "灰烬": "ash", "刺客": "ash",
+        "儿子": "atlas", "岩": "atlas", "石头": "atlas", "石甲": "atlas", "石男": "atlas", "土甲": "atlas",
+        "女妖": "banshee", "音妈": "banshee",
+        "巴奴克": "baruuk", "和尚": "baruuk", "武僧": "baruuk",
+        "卡利班": "caliban",
         "龙": "chroma", "龙甲": "chroma",
-        "鹿": "oberon", "鹿甲": "oberon",
-        "石头": "atlas", "岩": "atlas",
+        "柠檬": "citrine", "晶妹": "citrine",
+        "达加斯": "dagath",
+        "但丁": "dante",
+        "火女": "ember", "火鸡": "ember",
+        "扶她": "equinox", "阴阳": "equinox", "阴阳人": "equinox",
+        "咖喱": "excalibur", "咖喱棒": "excalibur", "圣剑": "excalibur",
+        "冰": "frost", "冰男": "frost",
         "血妈": "garuda",
-        "高斯": "gauss",
-        "章鱼": "octavia", "章鱼姐": "octavia",
+        "玻璃": "gara", "玻璃刀": "gara",
+        "高斯": "gauss", "跑男": "gauss",
+        "肥仔": "grendel", "肥宅": "grendel", "胖子": "grendel",
+        "电妹": "gyre", "陀螺": "gyre",
+        "哈罗": "harrow", "神父": "harrow", "主教": "harrow",
+        "母牛": "hildryn", "盾妹": "hildryn",
+        "泡澡": "hydroid", "水": "hydroid", "水男": "hydroid",
+        "沙": "inaros", "沙甲": "inaros", "沙王": "inaros",
+        "弓妹": "ivara",
+        "玉": "jade",
+        "猫": "khora", "鞭子": "khora", "猫甲": "khora",
+        "库尔沃": "kullervo",
+        "炼金": "lavos", "药水哥": "lavos", "蛇光": "lavos", "蛇甲": "lavos",
+        "护眼明": "limbo", "间谍甲": "limbo", "李明博": "limbo", "小明": "limbo",
+        "弱鸡": "loki", "洛基": "loki", "诡计": "loki",
+        "磁力": "mag", "磁妹": "mag", "马哥": "mag",
+        "女枪": "mesa",
+        "幻影": "mirage", "小丑": "mirage",
+        "摸": "nekros", "摸尸": "nekros", "死灵": "nekros", "血摸": "nekros",
+        "哪吒": "nezha",
+        "感染甲": "nidus", "蛆": "nidus", "蛆爹": "nidus", "虫甲": "nidus",
+        "加速娃": "nova", "减速娃": "nova", "核弹": "nova", "诺娃": "nova",
+        "脑控": "nyx", "脑溢血": "nyx",
+        "奶爸": "oberon", "鹿": "oberon", "鹿甲": "oberon", "驱魔": "oberon",
+        "DJ": "octavia", "DJ甲": "octavia", "章鱼": "octavia", "章鱼姐": "octavia", "音乐甲": "octavia",
+        "舞蛛": "oraxia", "蜘蛛": "oraxia", "蜘蛛妹": "oraxia", "蜘蛛甲": "oraxia",
+        "普洱茶": "protea", "奶球": "protea", "茶妹": "protea",
+        "方块": "qorvex",
+        "夜灵": "revenant", "夜灵甲": "revenant", "亡魂": "revenant",
+        "踩牛": "rhino", "豆牛": "rhino", "牛": "rhino", "牛甲": "rhino", "犀牛": "rhino", "斗牛": "rhino", "吼牛": "rhino",
+        "毒": "saryn", "毒妈": "saryn", "军需毒": "saryn",
+        "鬼": "sevagoth", "鬼甲": "sevagoth", "海盗": "sevagoth", "鲨鱼辣椒": "sevagoth", "幽灵甲": "sevagoth",
+        "斯巴达": "styanax", "斯泰纳克斯": "styanax",
+        "蝶妹": "titania", "蝶甲": "titania", "蝴蝶": "titania",
+        "奶": "trinity", "奶妈": "trinity",
+        "疯狗": "valkyr", "女汉子": "valkyr", "女武神": "valkyr", "瓦喵": "valkyr", "小强": "valkyr",
+        "炸弹人": "vauban", "工程": "vauban",
+        "电": "volt", "电关": "volt", "电男": "volt", "电王": "volt",
+        "狼": "voruna", "狼甲": "voruna", "狼妹": "voruna", "狼母": "voruna",
+        "花妈": "wisp", "花女": "wisp", "花姐": "wisp", "花甲": "wisp", "猫头鹰": "wisp",
+        "吗喽": "wukong", "猴": "wukong", "猴子": "wukong", "悟空": "wukong",
+        "拼装甲": "xaku", "遗骸": "xaku", "紫妹": "xaku",
+        "冲浪妹": "yareli", "水妹": "yareli", "鸭梨": "yareli",
+        "鸟": "zephyr", "鸟姐": "zephyr",
+
+        # 双子战甲
+        "双子": "sirius_and_orion", "小黑儿子": "sirius_and_orion",
 
         # 赋能（Arcane）
-        "充沛": "arcane_energize",
-        "复仇": "arcane_avenger",
-        "守护": "arcane_guardian",
-        "生机": "arcane_vitality",
+        "加速": "arcane_acceleration",
+        "庇护": "arcane_aegis",
+        "复仇": "arcane_avenger", "复仇者": "arcane_avenger",
         "壁垒": "arcane_barrier",
+        "后果": "arcane_consequence",
+        "偏斜": "arcane_deflection",
+        "死首": "arcane_primary_deadhead",
+        "副死首": "arcane_secondary_deadhead",
+        "优雅": "arcane_grace",
+        "守护": "arcane_guardian",
+        "近战狂怒": "arcane_fury",
+        "狙击动量": "arcane_momentum",
+        "无效": "arcane_nullifier",
         "坚持": "arcane_persistence",
+        "精准": "arcane_pistoleer",
+        "抵抗": "arcane_resistance",
+        "打击": "arcane_strike",
+        "终结": "arcane_ultimatum",
+        "迅捷": "arcane_velocity",
+        "生机": "arcane_vitality",
+        "充沛": "arcane_energize",
+        "觉醒": "arcane_awakening",
     },
 })
 
@@ -287,6 +331,8 @@ def _panel_keyboard() -> Keyboard:
         .callback("🎮 游戏中", f"{CB_STATUS}ingame")
         .callback("👻 隐身", f"{CB_STATUS}invisible")
         .row()
+        .callback("⚪️ 离线", f"{CB_STATUS}offline")
+        .row()
         .callback("📊 我的状态", CB_ME)
         .callback("🚪 解绑", CB_LOGOUT)
     )
@@ -294,8 +340,10 @@ def _panel_keyboard() -> Keyboard:
 
 @listener("wm")
 async def wm_panel(ctx: Context, *args, **kwargs):
-    """面板；带 online/ingame/invisible 参数时直接改状态。"""
+    """面板；带 online/ingame/invisible/offline 参数时直接改状态。"""
     sub = (args[0] if args else "").strip().lower()
+    if sub == "in_game":
+        sub = "ingame"
     if sub in SETTABLE_STATUSES:
         await _do_set_status(ctx, sub)
         return
@@ -325,7 +373,7 @@ async def wm_panel(ctx: Context, *args, **kwargs):
 
     lines.append("")
     lines.append("查价：/price 满级充沛 · /price 咖喱p 图纸")
-    lines.append("状态：/wmstatus ingame · 或直接 /wm ingame")
+    lines.append(    "状态：/wmstatus ingame · /wm offline 可断开连接")
 
     await ctx.reply_text("\n".join(lines), reply_markup=_panel_keyboard())
 
@@ -449,6 +497,14 @@ async def wm_who(ctx: Context, *args, **kwargs):
 # ------------------------------------------------------------------ 状态
 async def _do_set_status(ctx: Context, status: str, *, session: Optional[WMSession] = None) -> None:
     status = (status or "").strip().lower()
+    if status == "in_game":
+        status = "ingame"
+
+    legacy_status_mode = str((cfg.get("status_write") or {}).get("mode") or "").lower()
+    if legacy_status_mode == "off":
+        await ctx.reply_text("❌ 状态写入已关闭（status_write.mode = off）")
+        return
+
     try:
         client = await wm()
     except WMError as exc:
@@ -460,29 +516,20 @@ async def _do_set_status(ctx: Context, status: str, *, session: Optional[WMSessi
         await ctx.reply_text("你还没绑定 WM 账号，先 /wmlogin 邮箱 密码")
         return
 
-    mode = str((cfg.get("status_write") or {}).get("mode") or "auto")
-    verify = bool((cfg.get("status_write") or {}).get("verify", True))
     try:
-        result = await client.set_status(status, session, mode=mode, verify=verify)
+        result = await client.set_status(status, session)
     except WMError as exc:
-        hint = ""
-        if exc.kind == "auth":
-            hint = "\n凭证可能过期了，重新 /wmlogin"
-        else:
-            hint = "\n提示：官方 v2 未公开状态写入端点；试试 config/wm.json 里 status_write.mode 改成 v1 或 v2"
+        hint = "\n凭证可能过期了，重新 /wmlogin" if exc.kind == "auth" else ""
         await ctx.reply_text(f"❌ 设置失败：{exc}{hint}")
         return
 
     label = STATUS_LABEL.get(status, status)
-    if result.get("confirmed"):
-        await ctx.reply_text(f"✅ {session.label} 状态已更新：{label}（经 {result.get('via')} 写入并回读确认）")
-    elif result.get("verified"):
-        await ctx.reply_text(
-            f"⚠️ 请求已接受，但回读到的状态是 {result.get('verified')}（目标 {status}）\n"
-            f"写入路径：{result.get('via')}"
-        )
+    if status == "offline":
+        await ctx.reply_text(f"✅ {session.label} 状态已设为离线：WebSocket 已断开")
+    elif result.get("confirmed"):
+        await ctx.reply_text(f"✅ {session.label} 状态已更新：{label}（WebSocket 服务端已确认）")
     else:
-        await ctx.reply_text(f"⚠️ 请求已发出（经 {result.get('via')}），但没能回读确认，稍后用 /wmstatus 查看")
+        await ctx.reply_text(f"⚠️ 请求已发出（经 {result.get('via')}），但没收到服务端确认，请稍后重试")
 
 
 @listener("wmstatus")

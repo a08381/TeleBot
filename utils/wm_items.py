@@ -78,6 +78,7 @@ class Item:
 PART_WORDS: dict[str, str] = {
     "set": "set", "套装": "set", "一套": "set", "全套": "set", "整件": "set", "组": "set",
     "blueprint": "blueprint", "bp": "blueprint", "图纸": "blueprint", "蓝图": "blueprint", "设计图": "blueprint",
+    "总图": "blueprint",
     "chassis": "chassis", "机体": "chassis", "机身": "chassis",
     "neuroptics": "neuroptics", "神经光元": "neuroptics", "神经": "neuroptics", "头部": "neuroptics", "头": "neuroptics",
     "systems": "systems", "系统": "systems", "系统组件": "systems",

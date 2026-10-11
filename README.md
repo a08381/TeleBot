@@ -255,7 +255,7 @@ pip install curl_cffi
 
 ```text
 /wm                                 面板：自己绑定的账号 + 状态按钮
-/wm online|ingame|invisible          改**自己**账号的状态
+/wm online|ingame|invisible|offline  改**自己**账号的状态
 /wmstatus [状态]                     查看 / 改自己账号的状态
 /wmlogin [邮箱 密码]                  绑定（不带参数 = 主人用 config/wm.json 里的账号）
 /wmlogout [tg用户id]                 解绑（不带参数 = 解绑自己；带 id 需主人权限）
@@ -271,7 +271,15 @@ pip install curl_cffi
 /price 满级充沛          -> Arcane Energize，只统计 rank 5
 /price 咖喱p             -> Excalibur Prime Set
 /price 咖喱p 图纸         -> Excalibur Prime Blueprint
+/price 咖喱p 总图         -> Excalibur Prime Blueprint
 /price 电男p 机体         -> Volt Prime Chassis
+/price DJp               -> Octavia Prime Set
+/price 主教p              -> Harrow Prime Set
+/price 蝶妹p              -> Titania Prime Set
+/price 双子               -> Sirius & Orion
+/price 蜘蛛甲             -> Oraxia
+/price 狼甲p              -> Voruna Prime Set
+/price 满级优雅            -> Arcane Grace，按满级过滤
 /price nikana prime set platform=xbox crossplay=true
 ```
 
@@ -282,12 +290,15 @@ pip install curl_cffi
 ```jsonc
 "aliases": {
   "咖喱": "excalibur",     // 值是不带 _prime / _set 的**物品基名**
-  "充沛": "arcane_energize"
+  "充沛": "arcane_energize",
+  "主教": "harrow",
+  "蝶妹": "titania",
+  "双子": "sirius_and_orion"
 }
 ```
 
 自动识别的后缀：`p` / `prime` / `圣装` → `_prime`；`套装` / `set` → `_set`；
-`图纸` / `bp` → `_blueprint`；机体 / 系统 / 神经光元 / 刀刃 / 枪管… → 对应 part。
+`图纸` / `bp` / `总图` → `_blueprint`；机体 / 系统 / 神经光元 / 刀刃 / 枪管… → 对应 part。
 等级支持 `满级`、`r3`、`3级`、`rank=3`；Mod / Arcane 不指定等级时会按等级分组列出。
 
 ### 配置（config/wm.json）
@@ -304,10 +315,13 @@ pip install curl_cffi
 | `browser.*` | 被 Cloudflare 拦时填 `impersonate`（需 `pip install curl_cffi`）与 Cookie |
 | `rate_limit.rps` | 官方公共限流 **3 RPS**，别调高（多账号共享同一个桶） |
 | `cache.items_ttl` / `orders_ttl` | 物品清单 24h、订单 60s（官方要求必须缓存） |
-| `status_write.mode` | `auto`（先 v2 再 v1）/ `v2` / `v1` / `off` |
+| `api.timeout` | HTTP 与状态 WebSocket 连接/响应超时 |
 | `price.only_online` | 只统计 online / ingame 的挂单（默认 `true`） |
 | `price.group_by_rank` | Mod / Arcane 未指定等级时按等级分组 |
 | `session_file` | 会话库：`{tg用户id -> 账号}`，含 JWT，权限 0600 |
+
+旧配置中的 `status_write.mode = "off"` 仍可用来禁用状态切换；`auto` / `v1` / `v2`
+不再切换写入协议，状态统一通过 WebSocket 设置。
 
 多账号模型（为什么这样设计）：
 
@@ -321,20 +335,20 @@ WMClient（单例：连接池 + 限流器 + 公开数据缓存）
 每个指令按**发起者**（按钮则按点击者）取自己的账号。
 公开数据（清单 / 订单 / 统计）全局共享缓存，不区分账号。
 
-### 状态语义与「为什么写入不保证成功」
+### 状态语义与 WebSocket 状态连接
 
 官方 FAQ：`ingame` 可交易，`online` 约 1 小时内可交易，`invisible` 不可交易；
-`offline` 是断线后的自动状态，所以不提供手动设置。
+状态写入使用 `wss://warframe.market/socket-v2`：选择 online / ingame / invisible
+时，客户端会为该绑定账号认证并保持独立的 WebSocket 连接；选择 `offline` 或解绑时关闭连接，
+由 WM 将账号状态更新为离线。
 
-官方 v2 文档**没有公开在线状态写入端点**，v1 的 `PUT /profile/status` 属于社区沿用。
-插件因此做「双路径探测 + 回读校验」：先 `PATCH /v2/me`，失败再 `PUT /v1/profile/status`，
-写完都用 `GET /v2/me` 复核 —— 一致才回「状态已更新」，否则明说
-「请求已接受，但状态未确认」，**不假装成功**。装好后先跑 `/wmdiag` 看当前哪条路通。
+状态变更等待 WebSocket 服务端确认；连接在运行期间由客户端心跳维持，进程退出或网络断开时，
+WM 会按断连处理。
 
 ### API 现状（重要）
 
 WM 的新 API 合同仍 **< 1.0，随时可能破坏性变更**，官方明确 v1 已弃用但 OAuth 2.0 未开放、
-需要授权的集成仍要走 v1 授权流程。所以这里是「v1 登录 + v2 读数据 + 状态写入双路径」：
+需要授权的集成仍要走 v1 授权流程。所以这里是「v1 登录 + v2 读数据 + WebSocket 写状态」：
 
 | 用途 | 端点 |
 | --- | --- |
@@ -345,4 +359,3 @@ WM 的新 API 合同仍 **< 1.0，随时可能破坏性变更**，官方明确 v
 | 历史统计 | `GET /v1/items/{slug}/statistics`（可选，挂了就自动省略） |
 
 `/wmdiag`（仅主人）会逐个试探这些端点并打印结果 —— 接口变了先看它。
-
