@@ -14,7 +14,7 @@ import asyncio
 import logging
 
 from telegram import Update
-from telegram.ext import Application, ApplicationBuilder, ExtBot
+from telegram.ext import Application, ApplicationBuilder
 
 from utils.config import get_config, load_config
 from utils.http_pool import http_start, http_stop
@@ -91,8 +91,6 @@ async def _run_custom_webhook(application: Application) -> None:
         if not isinstance(data, dict):
             raise web.HTTPBadRequest(text="Telegram update must be a JSON object")
         update = Update.de_json(data, application.bot)
-        if isinstance(application.bot, ExtBot) and application.bot.arbitrary_callback_data:
-            application.bot.insert_callback_data(update)
         await application.update_queue.put(update)
         return web.Response(status=200)
 
