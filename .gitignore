@@ -1,5 +1,6 @@
 config.json
 config/*.json
+config/*.sqlite3*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -16,6 +16,7 @@ from typing import List
 
 from .dispatcher import Buttons, Listeners
 from .lifecycle import clear_hooks
+from .webhook import clear_webhook_routes
 from utils.plugin_config import clear_plugin_configs
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ def unload_all_plugins() -> None:
     Buttons.clear()
     clear_plugin_configs()  # 让插件下次 import 时重新读 config/<name>.json
     clear_hooks()           # 生命周期钩子由插件重新注册
+    clear_webhook_routes()  # 自定义 webhook 路由由插件重新 import 时重新注册
     for name in list(sys.modules):
         if name == PLUGINS_PACKAGE or name.startswith(f"{PLUGINS_PACKAGE}."):
             sys.modules.pop(name, None)

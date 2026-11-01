@@ -39,6 +39,7 @@ class WebhookSettings:
     url: str = ""
     port: int = 7755
     path: str = "/"
+    secret_token: str = ""
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "WebhookSettings":
@@ -48,6 +49,7 @@ class WebhookSettings:
             url=str(data.get("url", "")).rstrip("/"),
             port=int(data.get("port", 7755)),
             path=str(data.get("path", "/")),
+            secret_token=str(data.get("secret_token", "")),
         )
 
 
@@ -60,7 +62,10 @@ class TelegramSettings:
         "telegram": {
           "token": "123456:ABC...",
           "host": "https://api.telegram.org",
-          "webhook": {"enable": false, "url": "", "port": 7755, "path": "/"}
+          "webhook": {
+            "enable": false, "url": "", "port": 7755,
+            "path": "/", "secret_token": ""
+          }
         }
 
     旧格式（顶层 t_token / t_host / webhook）仍然兼容，但建议迁移到 telegram 段。

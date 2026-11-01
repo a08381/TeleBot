@@ -31,6 +31,7 @@ from .keyboard import Keyboard
 from .lifecycle import shutdown, startup
 from .loader import load_all_plugins, reload_all_plugins, unload_all_plugins
 from .logging_setup import setup_logging
+from .webhook import webhook_route
 from utils.plugin_config import PluginConfig, plugin_config
 from utils.config import BotSettings, get_config, load_config
 
@@ -56,6 +57,7 @@ __all__ = [
     "PluginConfig",
     "startup",
     "shutdown",
+    "webhook_route",
     "load_all_plugins",
     "reload_all_plugins",
     "unload_all_plugins",

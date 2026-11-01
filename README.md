@@ -156,7 +156,10 @@ cfg.reset()            # 恢复默认值
   "telegram": {
     "token": "123456:ABC...",
     "host": "https://api.telegram.org",
-    "webhook": { "enable": false, "url": "", "port": 7755, "path": "/" }
+    "webhook": {
+      "enable": false, "url": "", "port": 7755, "path": "/",
+      "secret_token": ""
+    }
   },
   "owner_ids": [535840409],
   "log_level": "INFO",
@@ -165,6 +168,7 @@ cfg.reset()            # 恢复默认值
 ```
 
 `telegram.host` 只在用自建 API / 反代时改，`webhook.enable=false` 走长轮询（默认）。
+`webhook.secret_token` 可选；启用时 Telegram webhook 会校验请求头中的 secret token。
 **不含任何图站参数**。没写的字段一律用代码默认值。
 
 旧格式的顶层 `t_token` / `t_host` / `webhook` 仍能读，自动兜底（telegram 段优先），
@@ -368,3 +372,40 @@ WM 的新 API 合同仍 **< 1.0，随时可能破坏性变更**，官方明确 v
 | 历史统计 | `GET /v1/items/{slug}/statistics`（可选，挂了就自动省略） |
 
 `/wmdiag`（仅主人）会逐个试探这些端点并打印结果 —— 接口变了先看它。
+
+## Microsoft 365 E5 续订插件（e5）
+
+参考项目的定位不同：
+
+- [Musicminion/e5](https://github.com/Musicminion/e5) 是独立部署的 Spring Boot 网站服务，提供 GitHub OAuth 用户登录、Outlook 账户授权与续订任务管理，并使用 MySQL、Redis、InfluxDB 和定时任务组件。它面向网页部署，不是 Telegram 插件。
+- [iyear/E5SubBot](https://github.com/iyear/E5SubBot) 是 Telegram Bot：用户绑定自己的 Microsoft 应用和账户授权，Bot 定时调用 Microsoft Graph 的 Outlook 邮件读取接口，并提供账户查询、解绑、任务结果通知和管理员手动执行。
+
+本项目按 E5SubBot 的 Bot 工作流实现了轻量插件：使用 Microsoft OAuth 授权码绑定账户、保存轮换后的 refresh token、周期性读取 `/me/messages`、向账户所有者汇报结果，并支持查看/解绑账户及主人手动执行全局任务。续订效果取决于 Microsoft 账户和开发者订阅状态，Graph API 活动不保证续订。
+
+首次加载后会生成 `config/e5.json`。主要选项：
+
+| 配置项 | 说明 | 默认值 |
+| --- | --- | --- |
+| `scheduler_enabled` | 是否启用后台定时任务 | `true` |
+| `interval_hours` | 任务间隔（小时） | `24` |
+| `max_accounts_per_user` | 每个 Telegram 用户的绑定上限 | `5` |
+| `max_consecutive_errors` | 连续失败达到上限后暂停账户；设为 `0` 或负数不自动暂停 | `5` |
+| `request_concurrency` | Graph 请求并发数 | `3` |
+| `request_timeout` | 单次 HTTP 请求超时（秒） | `20` |
+| `database_path` | OAuth 凭据与账户数据的 SQLite 路径 | `config/e5_accounts.sqlite3` |
+| `redirect_uri` | Microsoft 应用注册及授权时使用的回调 URI，必须一致；webhook 模式留空时自动使用 `https://<webhook.url>/e5/callback` | 空 |
+
+在 Microsoft Entra 中注册应用并创建 client secret，配置与 `redirect_uri` 完全一致的回调 URI，并授予 delegated `User.Read`、`Mail.Read` 权限。webhook 模式下，E5 回调与 Telegram webhook 共用 `telegram.webhook.port`，回调路径固定为 `/e5/callback`；`telegram.webhook.url` 应是外部 HTTPS 主机地址，反向代理需将该主机的 Telegram webhook 路径和 `/e5/callback` 都转发到同一端口。可选配置 `telegram.webhook.secret_token` 后，Telegram 更新请求会校验 `X-Telegram-Bot-Api-Secret-Token`。授权码由 Bot 服务端使用 client secret 兑换，OAuth 回调不会写入访问日志。
+
+webhook 模式下浏览器授权成功后会自动完成绑定，账户别名使用 Microsoft 显示名称；`/e5finish` 仍可在轮询模式或回调服务不可达时手动完成。`/e5bind` 命令包含 client secret，只能在 Bot 私聊中发送。
+
+```text
+/e5bind <client_id> <client_secret>
+# 点击授权链接并登录对应账户
+# webhook 模式由回调自动绑定；轮询模式手动粘贴回调地址：
+/e5finish <浏览器完整回调地址> <账户别名>
+/e5accounts
+/e5unbind
+```
+
+其他指令：`/e5help` 查看帮助，`/e5cancel` 取消等待中的绑定，`/e5run` 由 `owner_ids` 中的主人手动执行全部已启用账户。绑定、账户信息和解绑仅允许私聊；连续失败到达阈值的账户会暂停而不会被删除。数据库文件已加入 `.gitignore`，包含应用密钥和 refresh token，应按敏感凭据保护并纳入自己的备份策略；Windows 部署请限制该文件的访问 ACL。

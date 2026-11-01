@@ -8,7 +8,8 @@
       "enable": false,
       "url": "https://example.com",
       "port": 7755,
-      "path": "/"
+      "path": "/",
+      "secret_token": ""
     }
   },
 
