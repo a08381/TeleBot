@@ -60,6 +60,7 @@ class Item:
     thumb: str = ""
     tradable: bool = True
     tags: tuple[str, ...] = ()
+    item_id: str = ""
 
     @property
     def display(self) -> str:
@@ -239,6 +240,9 @@ def _pick_names(raw: Mapping[str, Any]) -> tuple[str, str]:
     name_zh = ""
     i18n = raw.get("i18n")
     if isinstance(i18n, dict):                       # v2：{"zh": {...}} 或 {"zh": "..."}
+        english = i18n.get("en")
+        if isinstance(english, Mapping):
+            name_en = name_en or str(english.get("name") or english.get("item_name") or "")
         for lang in ("zh", "zh-hans", "zh-hant", "zh-hk"):
             value = i18n.get(lang)
             if isinstance(value, Mapping):
@@ -263,6 +267,7 @@ class ItemIndex:
 
     def __init__(self) -> None:
         self._items: dict[str, Item] = {}
+        self._item_ids: dict[str, str] = {}
         self._keys: dict[str, list[str]] = {}     # 归一化名 -> slug 列表
         self._aliases: dict[str, str] = {}        # 归一化黑话 -> 物品基名
         self._loaded_at = 0.0
@@ -270,6 +275,7 @@ class ItemIndex:
     # ---------------------------------------------------------- 构建
     def load(self, raw_items: Iterable[Mapping[str, Any]]) -> int:
         self._items.clear()
+        self._item_ids.clear()
         self._keys.clear()
         for raw in raw_items:
             if not isinstance(raw, Mapping):
@@ -283,16 +289,24 @@ class ItemIndex:
             )
             tradable = raw.get("tradable")
             tags = raw.get("tags")
+            i18n = raw.get("i18n")
+            english_i18n = i18n.get("en") if isinstance(i18n, Mapping) else {}
+            thumb = raw.get("thumb") or (
+                english_i18n.get("thumb") if isinstance(english_i18n, Mapping) else ""
+            )
             item = Item(
                 slug=slug,
                 name_en=name_en or slug.replace("_", " ").title(),
                 name_zh=name_zh,
                 max_rank=max_rank,
-                thumb=str(raw.get("thumb") or ""),
+                thumb=str(thumb or ""),
                 tradable=bool(tradable) if tradable is not None else True,
                 tags=tuple(str(t) for t in tags) if isinstance(tags, (list, tuple)) else (),
+                item_id=str(raw.get("id") or raw.get("item_id") or ""),
             )
             self._items[slug] = item
+            if item.item_id:
+                self._item_ids[item.item_id] = slug
             for name in (slug, name_en, name_zh):
                 key = normalize(name)
                 if key:
@@ -318,6 +332,10 @@ class ItemIndex:
 
     def get(self, slug: str) -> Optional[Item]:
         return self._items.get(slug)
+
+    def get_by_id(self, item_id: str) -> Optional[Item]:
+        slug = self._item_ids.get(str(item_id or ""))
+        return self._items.get(slug) if slug else None
 
     def _candidates(self, base: str, prime: bool, part: Optional[str]) -> list[str]:
         """按优先级列出候选 slug（越靠前越可能）。"""

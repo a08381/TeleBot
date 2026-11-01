@@ -32,6 +32,8 @@ API 现状（2026-09，合同版本仍 < 1.0，随时可能变）
 
     登录        POST  /v1/auth/signin      （社区强一致；官方说 v1 仍用于授权）
     当前用户    GET   /v2/me               （官方已文档化）
+    我的挂单    GET   /v2/orders/my        （需登录）
+    改挂单价    PATCH /v2/order/{id}       （需登录）
     订单        GET   /v2/orders/item/{slug}   （官方已文档化，公开无需登录）
     物品清单    GET   /v1/items            （回退 /v2/items）
     历史统计    GET   /v1/items/{slug}/statistics （社区一致，可选功能）
@@ -52,6 +54,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from urllib.parse import quote
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -381,6 +384,7 @@ def normalize_order(raw: Mapping[str, Any]) -> dict:
 
     return {
         "id": str(raw.get("id") or ""),
+        "item_id": str(raw.get("itemId") or raw.get("item_id") or ""),
         "type": order_type,
         "platinum": platinum,
         "quantity": quantity,
@@ -964,7 +968,92 @@ class WMClient:
         self._orders_cache[key] = (now, normalized)
         return normalized
 
-    async def get_statistics(self, slug: str) -> dict:
+    async def get_my_orders(self, session: WMSession) -> list[dict]:
+        """当前登录用户的订单，始终用显式会话鉴权，不共享或缓存账号数据。"""
+        if session is None or not session.logged_in:
+            raise WMError("该用户还没有绑定 Warframe Market 账号，先 /wmlogin", kind="auth")
+        data = await self.call(
+            "GET", f"{self.v2_base}/orders/my", session=session, v2=True,
+        )
+        return [normalize_order(order) for order in _extract_orders(data)]
+
+    async def update_order_price(
+        self,
+        order_id: str,
+        platinum: int,
+        session: WMSession,
+    ) -> dict:
+        """更新当前会话名下订单的白金价格。"""
+        order_id = str(order_id or "").strip()
+        try:
+            platinum = int(platinum)
+        except (TypeError, ValueError) as exc:
+            raise WMError("价格必须是正整数", kind="config") from exc
+        if not order_id:
+            raise WMError("缺少订单 ID", kind="config")
+        if platinum <= 0:
+            raise WMError("价格必须大于 0", kind="config")
+        if session is None or not session.logged_in:
+            raise WMError("该用户还没有绑定 Warframe Market 账号，先 /wmlogin", kind="auth")
+
+        data = await self.call(
+            "PATCH",
+            f"{self.v2_base}/order/{quote(order_id, safe='')}",
+            session=session,
+            v2=True,
+            json={"platinum": platinum},
+            headers={"Content-Type": "application/json"},
+        )
+        if isinstance(data, dict) and isinstance(data.get("order"), dict):
+            data = data["order"]
+        if not isinstance(data, dict):
+            raise WMError("更新订单的响应格式不符", kind="api")
+        normalized = normalize_order(data)
+        if normalized.get("platinum") != platinum:
+            raise WMError(
+                f"服务端未确认新价格（返回 {normalized.get('platinum')}p）",
+                kind="api",
+            )
+        self._orders_cache.clear()
+        return normalized
+
+    async def update_order_visibility(
+        self,
+        order_id: str,
+        visible: bool,
+        session: WMSession,
+    ) -> dict:
+        """更新当前会话名下订单的可见状态。"""
+        order_id = str(order_id or "").strip()
+        if not order_id:
+            raise WMError("缺少订单 ID", kind="config")
+        if not isinstance(visible, bool):
+            raise WMError("订单可见状态必须是布尔值", kind="config")
+        if session is None or not session.logged_in:
+            raise WMError("该用户还没有绑定 Warframe Market 账号，先 /wmlogin", kind="auth")
+
+        data = await self.call(
+            "PATCH",
+            f"{self.v2_base}/order/{quote(order_id, safe='')}",
+            session=session,
+            v2=True,
+            json={"visible": visible},
+            headers={"Content-Type": "application/json"},
+        )
+        if isinstance(data, dict) and isinstance(data.get("order"), dict):
+            data = data["order"]
+        if not isinstance(data, dict):
+            raise WMError("更新订单可见状态的响应格式不符", kind="api")
+        normalized = normalize_order(data)
+        if normalized.get("visible") is not visible:
+            raise WMError(
+                f"服务端未确认订单可见状态（返回 {normalized.get('visible')!r}）",
+                kind="api",
+            )
+        self._orders_cache.clear()
+        return normalized
+
+    async def get_statistics(self, slug: str, *, rank: Optional[int] = None) -> dict:
         """v1 历史统计（48 小时 / 90 天）。官方 v2 没给等价合同，属于可选功能。"""
         data = await self.call(
             "GET", f"{self.v1_base}/items/{slug}/statistics", session=None, auth=False, v2=False,
@@ -979,7 +1068,18 @@ class WMClient:
         for bucket in ("48hours", "90days"):
             series = closed.get(bucket)
             if isinstance(series, list) and series:
-                latest = series[-1]
+                valid_series = [point for point in series if isinstance(point, dict)]
+                if rank is not None:
+                    valid_series = [
+                        point for point in valid_series
+                        if str(point.get("mod_rank", "")) == str(rank)
+                    ]
+                if not valid_series:
+                    continue
+                latest = max(
+                    valid_series,
+                    key=lambda point: str(point.get("datetime") or ""),
+                )
                 if isinstance(latest, dict):
                     out[bucket] = {
                         "median": latest.get("median"),
@@ -1012,6 +1112,7 @@ class WMClient:
         await run(f"v1/items/{slug}/statistics（公开）", self.get_statistics(slug))
         if session is not None and session.logged_in:
             await run("v2/me（需登录）", self.get_me(session))
+            await run("v2/orders/my（需登录）", self.get_my_orders(session))
             await run("WebSocket /socket-v2（状态写入）", self.set_status("online", session))
         else:
             checks.append(("v2/me（需登录）", False, "当前用户未绑定账号，跳过"))
