@@ -1,6 +1,6 @@
-"""plugins/yiff.py —— 发送带内联按钮的图片。
+"""图站媒体命令、按钮及插件资源生命周期。
 
-本插件独占一份配置：config/yiff.json（首次加载自动生成）。
+本插件独占一份配置：config/yiff/config.json（首次加载自动生成）。
 e621/e926 相关的**全部**参数都在这里 —— 站点地址、UA、默认标签、限流、图池容量，
 以及过 Cloudflare 用的浏览器指纹与 Cookie；主配置 config.json 只管 Bot 本体。
 
@@ -14,7 +14,7 @@ e621/e926 相关的**全部**参数都在这里 —— 站点地址、UA、默�
 2. 失败则 reply_document → 支持任意格式
 3. 仍失败则自己下载字节再发 → 绕开 Telegram 侧下载被 e926 拒绝的情况
 
-过 Cloudflare 靠「浏览器指纹 + Cookie」（config/yiff.json 的 browser 段）：
+过 Cloudflare 靠「浏览器指纹 + Cookie」（config/yiff/config.json 的 browser 段）：
 CF 先看 TLS/HTTP2 指纹，httpx 的握手一看就是脚本，直接 403。填
 browser.impersonate（chrome124 等）后请求由 curl_cffi 发出，指纹与真浏览器一致；
 站点 Cookie（登录态、手填的 cf_clearance）也在这一段配。
@@ -31,15 +31,14 @@ from typing import Optional
 
 from core import BotError, Context, Keyboard, button, listener, plugin_config, shutdown, startup
 from utils.browser_profile import BrowserProfile
-from utils.http_pool import configure_site, http, http_health
-from utils.posts_pool import PoolSettings, Post, get_pool, pool_start, pool_stop
+from .http_pool import configure_site, http, http_health, http_start, http_stop
+from .posts_pool import PoolSettings, Post, get_pool, pool_start, pool_stop
 
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ 配置
-# 首次运行自动生成 config/yiff.json。
-# 站点与图池参数在 startup 钩子里用于建池，改动后需要重启进程（池已按旧参数建好）；
-# 其余参数（按钮、文案、体积上限）改完 /reload 即可生效。
+# 首次运行自动生成 config/yiff/config.json。
+# 站点与图池参数在 startup 钩子里用于建池，/reload 会停止旧资源并按新参数重建。
 cfg = plugin_config({
     # ---- 站点 ----
     "site": "https://e621.net",
@@ -256,7 +255,7 @@ async def yiff_next(ctx: Context, key: str) -> None:
 # --------------------------------------------------------------------------
 # 浏览器身份诊断：/fp（看当前指纹、Cookie、实际 UA）
 #
-# 只做展示，不改任何东西 —— 想换指纹/UA/Cookie 就改 config/yiff.json 再 /reload，
+# 只做展示，不改任何东西 —— 想换指纹/UA/Cookie 就改 config/yiff/config.json 再 /reload，
 # http() 发现浏览器身份变了会自动重建客户端。
 # --------------------------------------------------------------------------
 async def _status_text() -> str:
@@ -299,9 +298,7 @@ async def yiff_fp(ctx: Context, *args, **kwargs):
 
 
 # --------------------------------------------------------------------------
-# 图池生命周期：由本插件的配置驱动，挂在 core 的 startup / shutdown 钩子上。
-# 池实例放在 utils.posts_pool 的模块级单例里 —— 插件模块会被 /reload 重新导入，
-# 状态写在插件里热重载一次就没了。
+# 图池和 HTTP 客户端由本包共同管理，整包重载时按依赖顺序停止、重建。
 # --------------------------------------------------------------------------
 def _pool_settings() -> PoolSettings:
     pool_cfg = dict(cfg.get("pool") or {})
@@ -312,9 +309,13 @@ def _pool_settings() -> PoolSettings:
 
 @startup
 async def _start_pool(application=None) -> None:
+    await http_start()
     await pool_start(_pool_settings())
 
 
 @shutdown
 async def _stop_pool(application=None) -> None:
-    await pool_stop()
+    try:
+        await pool_stop()
+    finally:
+        await http_stop()

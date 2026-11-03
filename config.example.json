@@ -13,7 +13,7 @@
     }
   },
 
-  "owner_ids": [535840409],
+  "owner_ids": [],
   "log_level": "INFO",
   "log_dir": "logs",
   "log_split_streams": true,

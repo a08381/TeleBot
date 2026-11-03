@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from utils.e5_renewal import (
+from plugins.e5.e5_renewal import (
     E5RenewalError,
     E5RenewalStore,
     build_authorize_url,

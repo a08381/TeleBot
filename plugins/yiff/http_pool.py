@@ -1,24 +1,7 @@
-"""取图客户端的模块级单例（带浏览器指纹）。
+"""图站插件私有的 HTTP 客户端与站点配置。
 
-过 Cloudflare 靠两件事，都由本模块与 utils.browser_profile 提供：
-1. **浏览器指纹**：TLS/JA3 + HTTP/2 + 头顺序跟真实浏览器一致（curl_cffi 的 impersonate）
-2. **Cookie**：站点 Cookie（登录态、手填的 cf_clearance…），按域名注入
-
-关键约束：
-1. 必须放在 **顶层模块**（不放在 plugins/ 下）。
-   reload_all_plugins() 会 pop 掉所有 "plugins." 开头的 sys.modules，
-   单例若写在插件里，热重载一次就丢了。
-2. 单例只能在 **事件循环内** 创建/关闭，因此挂到 PTB 的 post_init / post_shutdown。
-3. 客户端是惰性的：没人取图就不建；站点/UA/指纹变了会自动重建。
-
-配置分两处：
-- **站点相关**（site / user_agent）由使用它的插件提供：插件 import 时调用
-  configure_site(...)，例见 plugins/yiff.py。这描述的是「访问哪个站」，属于业务。
-- **浏览器身份**（impersonate / cookies / headers / proxy / timeout）在插件配置的
-  browser 段，见 utils.browser_profile.BrowserProfile。
-
-没装 curl_cffi 时自动退回 httpx：功能不受影响，只是没有 TLS 指纹，
-启动日志与 /fp 都会提示。
+浏览器 HTTP 能力复用 utils.browser_profile，客户端实例由本包持有。
+整包重载前由插件停止钩子关闭连接，重新导入后按新配置创建实例。
 """
 
 from __future__ import annotations
@@ -28,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Union
 from urllib.parse import urlparse
 
-from .browser_profile import (
+from utils.browser_profile import (
     BrowserProfile,
     aclose_client,
     create_client,
@@ -191,8 +174,8 @@ class SiteClient:
         return self.browser.effective_ua(self.user_agent)
 
     async def aclose(self) -> None:
-        client, self._client = self._client, None
-        await aclose_client(client)
+        await aclose_client(self._client)
+        self._client = None
 
     async def request(self, method: str, url: str, **kwargs: Any) -> Any:
         if self._client is None:
@@ -221,12 +204,8 @@ async def _drop_client() -> None:
     global _client, _client_site
     if _client is None:
         return
-    old = _client
+    await _client.aclose()
     _client, _client_site = None, None
-    try:
-        await old.aclose()
-    except Exception as e:
-        logger.warning("关闭旧客户端失败: %s", e)
 
 
 async def http() -> SiteClient:

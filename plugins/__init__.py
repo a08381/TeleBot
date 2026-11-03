@@ -1,8 +1,7 @@
 """业务插件目录。
 
-约定：
-- 每个 .py 文件是一个插件，启动时自动被 core.loader 扫描加载
-- 只用 `from core import ...`（以及需要时的 `from utils import ...`），
-  不要 import telegram —— 所有 Telegram 交互都走 core.Context
-- 指令处理函数签名：async def f(ctx: core.Context, *args, **kwargs)
+支持单文件插件 name.py 和包插件 name/__init__.py。
+包入口可提供同步 setup()，显式导入同名处理器及包内工具；不递归扫描工具。
+资源通过 core.startup / shutdown 管理，重载会停止旧资源并卸载整个包。
+包内使用相对导入，共享的无业务状态工具可从 utils 导入。
 """

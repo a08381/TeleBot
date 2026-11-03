@@ -55,7 +55,8 @@ def _as_media(value: MediaSource, filename: Optional[str] = None) -> Any:
     if isinstance(value, (bytes, bytearray)):
         return InputFile(bytes(value), filename=filename or "file")
     if isinstance(value, Path):
-        return InputFile(value.open("rb"), filename=filename or value.name)
+        with value.open("rb") as stream:
+            return InputFile(stream, filename=filename or value.name)
     return value
 
 
@@ -149,11 +150,20 @@ class CallbackQuery:
 class Context:
     """一次更新（消息 / 回调）的上下文，插件唯一的操作入口。"""
 
-    __slots__ = ("_bot", "_update")
+    __slots__ = ("_bot", "_update", "_args", "_kwargs")
 
-    def __init__(self, bot: Bot, update: Update) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        update: Update,
+        *,
+        args: Optional[list[str]] = None,
+        kwargs: Optional[dict[str, str]] = None,
+    ) -> None:
         self._bot = bot
         self._update = update
+        self._args = list(args or [])
+        self._kwargs = dict(kwargs or {})
 
     # ------------------------------------------------------------ 逃生舱
     # 极少情况下插件需要原始对象（例如用 PTB 的高级特性），走这两个属性。
@@ -166,6 +176,16 @@ class Context:
         return self._update
 
     # ------------------------------------------------------------ 只读信息
+    @property
+    def args(self) -> list[str]:
+        """当前指令的位置参数副本。"""
+        return list(self._args)
+
+    @property
+    def kwargs(self) -> dict[str, str]:
+        """当前指令的键值参数副本。"""
+        return dict(self._kwargs)
+
     @property
     def user(self) -> Optional[User]:
         return User.from_raw(self._update.effective_user)

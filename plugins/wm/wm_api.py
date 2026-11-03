@@ -1,19 +1,15 @@
 """Warframe Market API 客户端（模块级单例，**多账号**）。
 
-为什么单独一份，而不是复用 utils.http_pool
-------------------------------------------
-``http_pool`` 是**单站点**单例：它只维护一个 ``_current_site``，两个插件都调
-``configure_site()`` 会互相抢占（源码里已经为此打了 warning）。yiff 拿它访问
-e621，wm 要访问 api.warframe.market 且带 JWT —— 站点与身份都不同，
-所以这里自建一份客户端。
+WM 与图站使用各自的私有客户端：站点、身份和生命周期相互独立，
+只共享 utils.browser_profile 中的 HTTP 客户端工厂。
 
-放在 ``utils/`` 而不是插件里的原因同 README：``/reload`` 会重新导入
-``plugins.*``，写在插件模块里的状态热重载一次就没了。
+本模块位于 wm 插件包内，客户端、状态连接和缓存随整包重载重建。
+会话写入 config/wm/wm_sessions.json，重载不删除磁盘上的账号凭据。
 
 多账号模型
 ----------
 **一个 Telegram user id 绑定一个 WM 账号**，会话全部存在 SessionStore 里
-（``config/wm_sessions.json``，权限 0600）：
+（``config/wm/wm_sessions.json``，权限 0600）：
 
     WMClient（单例：连接池 + 限流器 + 缓存）
       └── SessionStore: {tg_user_id -> WMSession}
@@ -59,7 +55,8 @@ from urllib.parse import quote
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
-from .browser_profile import BrowserProfile, aclose_client, create_client
+from utils.browser_profile import BrowserProfile, aclose_client, create_client
+from utils.plugin_config import get_plugin_config_dir
 
 logger = logging.getLogger(__name__)
 
@@ -825,7 +822,7 @@ class WMClient:
                 "payload": {"token": session.token, "deviceId": "telebot"},
             }))
             await self._wait_for_socket_reply(socket, "@wfm|cmd/auth/signIn")
-        except WMError:
+        except (WMError, asyncio.CancelledError):
             try:
                 await socket.close()
             except (WebSocketException, OSError, asyncio.TimeoutError) as exc:
@@ -1122,19 +1119,24 @@ class WMClient:
     async def aclose(self) -> None:
         async with self._status_lock:
             self.store.save()
-            sockets, self._status_sockets = self._status_sockets, {}
-            for socket in sockets.values():
+            errors = []
+            for user_id, socket in list(self._status_sockets.items()):
                 try:
                     await socket.close(code=1000, reason="client shutdown")
                 except (WebSocketException, OSError, asyncio.TimeoutError) as exc:
                     logger.warning("关闭 WM 状态 WebSocket 失败: %s", exc)
-            client, self._client = self._client, None
-            await aclose_client(client)
+                    errors.append(exc)
+                else:
+                    self._status_sockets.pop(user_id, None)
+            await aclose_client(self._client)
+            self._client = None
+            if errors:
+                raise WMError("部分 WM 状态连接关闭失败，请重试") from errors[0]
 
 
 # --------------------------------------------------------------------- 单例
-BASE_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_SESSIONS_PATH = BASE_DIR / "config" / "wm_sessions.json"
+BASE_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_SESSIONS_PATH = get_plugin_config_dir("wm", create=False) / "wm_sessions.json"
 
 _desired: Optional[WMClient] = None
 _desired_sig = ""
@@ -1207,10 +1209,8 @@ async def wm_start(application: Any = None) -> None:
 
 
 async def wm_stop(application: Any = None) -> None:
-    global _client, _client_sig
+    global _client, _client_sig, _desired, _desired_sig
     if _client is not None:
-        try:
-            await _client.aclose()
-        except Exception as exc:
-            logger.warning("关闭 WM 客户端失败: %s", exc)
-        _client, _client_sig = None, ""
+        await _client.aclose()
+    _client, _client_sig = None, ""
+    _desired, _desired_sig = None, ""

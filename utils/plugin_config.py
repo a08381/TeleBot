@@ -1,16 +1,18 @@
 """插件私有配置。
 
-每个插件一份 JSON，放在 ``config/<插件名>.json``，由插件自己声明默认值后
+每个插件一份 JSON，放在 ``config/<插件名>/config.json``，由插件自己声明默认值后
 自动生成，不写进根目录的 config.json（那里只放 Bot 主配置）。
 
 用法（在 plugins/xxx.py 里）::
 
-    from core import plugin_config
+    from core import get_plugin_config_dir, plugin_config
 
-    cfg = plugin_config({              # 插件名自动取模块名 -> config/xxx.json
+    cfg = plugin_config({              # 插件名自动取顶层模块名
         "timeout": 10,
         "tags": ["male"],
     })
+    directory = get_plugin_config_dir()  # -> 项目根/config/xxx，返回 Path 并创建目录
+    assert directory == cfg.directory
 
     cfg.get("timeout")        # -> 10
     cfg["tags"]               # -> ["male"]
@@ -20,6 +22,8 @@
     cfg.reload()              # 重新读盘（/reload 时会自动做）
 
 行为约定：
+- 旧的平铺 JSON   -> 在读取前移到插件目录，文件名统一为 config.json
+- 新旧文件冲突    -> 报错并保留两边，不覆盖已有数据
 - 文件不存在      -> 用默认值生成一份
 - 文件缺字段      -> 补上默认值并写回
 - 文件多出字段    -> 保留（不会被删）
@@ -34,8 +38,11 @@ import json
 import logging
 import re
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterator, Mapping, Optional, Tuple
+
+from .plugin_migration import _move_files
 
 logger = logging.getLogger(__name__)
 
@@ -54,14 +61,14 @@ _CACHE: Dict[str, "PluginConfig"] = {}
 def _sanitize(name: str) -> str:
     """防止插件名里出现 ../ 之类的路径穿越。"""
     safe = _UNSAFE_NAME.sub("_", (name or "").strip()) or "plugin"
-    return safe.lstrip(".")
+    return safe.lstrip(".") or "plugin"
 
 
 def _caller_plugin_name() -> str:
     """从调用者模块的 __name__ 推导插件名：plugins.yiff -> yiff。"""
     frame = inspect.currentframe()
     try:
-        caller = frame.f_back.f_back if frame and frame.f_back else None  # 跳过本函数与 plugin_config
+        caller = frame.f_back.f_back if frame and frame.f_back else None  # 跳过本函数与公共接口
         module = (caller.f_globals.get("__name__", "") if caller else "") or ""
     finally:
         del frame  # 避免引用循环
@@ -69,7 +76,32 @@ def _caller_plugin_name() -> str:
         return "plugin"
     if module == "__main__":
         return Path(sys.argv[0] if sys.argv and sys.argv[0] else "main").stem
+    if module.startswith("plugins."):
+        return module.split(".")[1]
     return module.rpartition(".")[2] or module
+
+
+def get_plugin_config_dir(name: Optional[str] = None, *, create: bool = True) -> Path:
+    """返回插件配置目录的绝对路径；默认推导插件名并创建目录。"""
+    config_name = _sanitize(name or _caller_plugin_name())
+    directory = (CONFIG_DIR / config_name).resolve()
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _migrate_legacy_config(name: str, target: Path) -> None:
+    """在读取配置前移动旧文件，保留内容；存在冲突时留给维护者处理。"""
+    source = CONFIG_DIR / f"{name}.json"
+    if not source.exists():
+        return
+    if target.exists():
+        raise FileExistsError(f"新旧插件配置同时存在，请先合并或移走旧文件：{source} -> {target}")
+    data = json.loads(source.read_text(encoding="UTF-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"旧插件配置必须是 JSON 对象，已保留原文件：{source}")
+    _move_files([(source, target)])
+    logger.info("插件配置已迁移: %s -> %s", source, target)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -111,7 +143,7 @@ def _coerce(value: Any, default: Any) -> Tuple[Any, bool]:
             return (dict(value), True) if isinstance(value, dict) else (default, True)
     except (TypeError, ValueError):
         return default, True
-    return value, False
+    return default, True
 
 
 def _merge(defaults: Mapping[str, Any], loaded: Mapping[str, Any]) -> Tuple[Dict[str, Any], bool]:
@@ -138,7 +170,7 @@ def _merge(defaults: Mapping[str, Any], loaded: Mapping[str, Any]) -> Tuple[Dict
     for key, value in loaded.items():           # 文件里多出来的键原样保留
         if key not in merged:
             merged[key] = value
-    return merged, changed
+    return deepcopy(merged), changed
 
 
 # --------------------------------------------------------------------- 对象
@@ -150,8 +182,8 @@ class PluginConfig(Mapping):
     def __init__(self, name: str, path: Path, defaults: Dict[str, Any], data: Dict[str, Any]) -> None:
         self._name = name
         self._path = path
-        self._defaults = defaults
-        self._data = data
+        self._defaults = deepcopy(defaults)
+        self._data = deepcopy(data)
 
     # ------------------------------------------------------------ 元信息
     @property
@@ -163,16 +195,21 @@ class PluginConfig(Mapping):
         return self._path
 
     @property
+    def directory(self) -> Path:
+        """当前插件的配置与数据目录。"""
+        return self._path.parent
+
+    @property
     def defaults(self) -> Dict[str, Any]:
-        return dict(self._defaults)
+        return deepcopy(self._defaults)
 
     def as_dict(self) -> Dict[str, Any]:
-        """返回副本（不含 _comment 之类的元信息请用 keys() 自行过滤）。"""
-        return dict(self._data)
+        """返回独立的深拷贝，包含 _comment 等元信息。"""
+        return deepcopy(self._data)
 
     # ------------------------------------------------------------ 读
     def __getitem__(self, key: str) -> Any:
-        return self._data[key]
+        return deepcopy(self._data[key])
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._data)
@@ -187,13 +224,13 @@ class PluginConfig(Mapping):
         except AttributeError:
             raise AttributeError(item)
         if item in data:
-            return data[item]
+            return deepcopy(data[item])
         raise AttributeError(f"插件 {self._name} 的配置里没有 {item!r}")
 
     # ------------------------------------------------------------ 写
     def set(self, key: str, value: Any, *, save: bool = True) -> "PluginConfig":
         """改一个键；save=True 时立即落盘。"""
-        self._data[key] = value
+        self._data[key] = deepcopy(value)
         if save:
             self.save()
         return self
@@ -201,15 +238,15 @@ class PluginConfig(Mapping):
     def update(self, values: Optional[Mapping[str, Any]] = None, *, save: bool = True, **kwargs: Any) -> "PluginConfig":
         """批量改键；save=True 时立即落盘。"""
         if values:
-            self._data.update(values)
-        self._data.update(kwargs)
+            self._data.update(deepcopy(dict(values)))
+        self._data.update(deepcopy(kwargs))
         if save:
             self.save()
         return self
 
     def reset(self, *, save: bool = True) -> "PluginConfig":
         """恢复成默认值。"""
-        self._data = dict(self._defaults)
+        self._data = deepcopy(self._defaults)
         if save:
             self.save()
         return self
@@ -229,8 +266,10 @@ class PluginConfig(Mapping):
 
     def reload(self) -> "PluginConfig":
         """重新读盘并与默认值合并（缺的补、多的留）。"""
-        merged, _ = _merge(self._defaults, _read_json(self._path))
+        merged, changed = _merge(self._defaults, _read_json(self._path))
         self._data = merged
+        if changed or not self._path.exists():
+            self.save()
         return self
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
@@ -248,15 +287,16 @@ def plugin_config(
 
     :param defaults:   插件的默认值；文件里缺的字段用它补
     :param name:       配置名，默认取调用者模块名（plugins.yiff -> yiff）
-    :param auto_create: 文件缺失/有新增字段时自动写回
+    :param auto_create: 文件缺失/有新增字段时自动写回；不影响已有旧配置文件的迁移
     """
     config_name = _sanitize(name or _caller_plugin_name())
-    path = CONFIG_DIR / f"{config_name}.json"
+    path = get_plugin_config_dir(config_name, create=False) / "config.json"
 
     cached = _CACHE.get(config_name)
     if cached is not None:
         return cached
 
+    _migrate_legacy_config(config_name, path)
     merged, changed = _merge(dict(defaults or {}), _read_json(path))
     config = PluginConfig(config_name, path, dict(defaults or {}), merged)
 

@@ -1,4 +1,6 @@
 from core import Context, listener, reload_all_plugins
+from core.lifecycle import PluginShutdownError
+from core.runtime import PluginsReloading
 
 
 def _is_allowed(ctx: Context) -> bool:
@@ -13,5 +15,9 @@ async def reload(ctx: Context, *args, **kwargs):
     if not _is_allowed(ctx):
         return
 
-    loaded = reload_all_plugins()
-    await ctx.reply_text(f"Reload Complete. ({len(loaded)} plugins)")
+    try:
+        loaded = await reload_all_plugins()
+    except (PluginShutdownError, PluginsReloading) as exc:
+        await ctx.reply_text(str(exc))
+        return
+    await ctx.reply_text(f"重载完成，已加载 {len(loaded)} 个插件。")

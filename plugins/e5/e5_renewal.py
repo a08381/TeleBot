@@ -21,11 +21,24 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).resolve().parents[1]
+BASE_DIR = Path(__file__).resolve().parents[2]
 AUTHORITY = "https://login.microsoftonline.com/common/oauth2/v2.0"
 GRAPH_API = "https://graph.microsoft.com/v1.0"
 DEFAULT_SCOPE = "openid offline_access User.Read Mail.Read"
 E5_CALLBACK_PATH = "/e5/callback"
+
+
+async def store_call(operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """在线程中执行数据库操作；取消时先等实际操作结束，避免跨重载写入。"""
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        try:
+            await worker
+        except Exception:
+            logger.exception("取消期间的 E5 数据库操作失败")
+        raise
 
 
 class E5RenewalError(Exception):
@@ -532,12 +545,12 @@ class E5RenewalService:
                 "userPrincipalName": account.user_principal_name,
                 "displayName": account.display_name,
             }
-            await asyncio.to_thread(
+            await store_call(
                 self.store.record_success, account.id, refresh_token, profile
             )
             return RenewalResult(account=account, success=True)
         except E5RenewalError as exc:
-            _, disabled = await asyncio.to_thread(
+            _, disabled = await store_call(
                 self.store.record_failure,
                 account.id,
                 str(exc),
@@ -551,7 +564,7 @@ class E5RenewalService:
         if self._run_lock.locked():
             raise E5RenewalError("已有续订任务正在运行")
         async with self._run_lock:
-            accounts = await asyncio.to_thread(self.store.list_enabled)
+            accounts = await store_call(self.store.list_enabled)
             if not accounts:
                 return []
             concurrency = max(1, int(self._settings["request_concurrency"]))
@@ -563,7 +576,15 @@ class E5RenewalService:
                     async with semaphore:
                         return await self._renew_account(client, account)
 
-                return list(await asyncio.gather(*(run_one(account) for account in accounts)))
+                results = await asyncio.gather(
+                    *(run_one(account) for account in accounts), return_exceptions=True
+                )
+                completed = []
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                    completed.append(result)
+                return completed
 
     async def start(
         self, scheduled_run: Callable[[], Awaitable[None]]
@@ -597,21 +618,22 @@ class E5RenewalService:
 
     async def stop(self) -> None:
         task = self._task
-        self._task = None
-        if task is None or task.done():
+        if task is None:
             return
-        task.cancel()
+        if not task.done():
+            task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
+        self._task = None
 
 
 _service: Optional[E5RenewalService] = None
 
 
 def configure_e5_renewal(settings: Mapping[str, Any]) -> E5RenewalService:
-    """Configure the reload-safe service singleton used by the E5 plugin."""
+    """配置本插件包内的服务单例；整包重载时创建新服务。"""
     global _service
     if _service is None:
         _service = E5RenewalService(settings)

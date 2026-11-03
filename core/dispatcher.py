@@ -15,6 +15,7 @@ from telegram import Update
 from telegram.ext import Application, CallbackContext, CallbackQueryHandler, MessageHandler, filters
 
 from .context import Context
+from .runtime import PluginsReloading, plugin_execution, plugin_generation
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,10 @@ Listeners: Dict[str, List[Callable]] = {}
 Buttons: Dict[str, List[Callable]] = {}
 
 # /cmd@botname k=v arg1 arg2
-CMD_RE = re.compile(r"^/(?P<command>[^@\s]+)(?:@(?P<bot_name>\S+))?(?:(?:\s+)(?P<args>.+))?$")
+CMD_RE = re.compile(
+    r"^/(?P<command>[^@\s]+)(?:@(?P<bot_name>\S+))?(?:\s+(?P<args>.*))?$",
+    re.DOTALL,
+)
 KEY_VALUE_RE = re.compile(r"^(?P<key>[^=]+)=(?P<value>.*)$")
 
 
@@ -100,14 +104,26 @@ async def _run_all(funcs: List[Callable], ctx: Context, *args: Any, **kwargs: An
     """并发调用所有处理函数；单个插件出错不影响其它插件，也不向上抛。"""
     if not funcs:
         return
-    results = await asyncio.gather(
-        *(func(ctx, *args, **kwargs) for func in funcs), return_exceptions=True
-    )
+    generation = plugin_generation()
+
+    async def invoke(func: Callable) -> None:
+        async with plugin_execution(generation):
+            await func(ctx, *args, **kwargs)
+
+    results = await asyncio.gather(*(invoke(func) for func in funcs), return_exceptions=True)
+    busy = False
     for func, result in zip(funcs, results):
-        if isinstance(result, BaseException):
+        if isinstance(result, PluginsReloading):
+            busy = True
+        elif isinstance(result, BaseException):
             logger.exception(
                 "插件 %s 执行失败", getattr(func, "__name__", func), exc_info=result
             )
+    if busy:
+        if ctx.is_callback:
+            await ctx.answer_query("插件正在重载，请稍后重试。")
+        else:
+            await ctx.reply_text("插件正在重载，请稍后重试。")
 
 
 async def dispatch_command(update: Update, context: CallbackContext) -> None:
@@ -120,14 +136,15 @@ async def dispatch_command(update: Update, context: CallbackContext) -> None:
     if parsed is None:
         return
     command, bot_name, args, kwargs = parsed
-    if bot_name and bot_name != context.bot.username:
+    if bot_name and bot_name.casefold() != (context.bot.username or "").casefold():
         return
 
-    funcs = Listeners.get(command.lower())
+    funcs = list(Listeners.get(command.lower(), ()))
     if not funcs:
         return
     logger.debug("command %s has been called.", command)
-    await _run_all(funcs, Context(context.bot, update), *args, **kwargs)
+    ctx = Context(context.bot, update, args=args, kwargs=kwargs)
+    await _run_all(funcs, ctx, *args, **kwargs)
 
 
 async def dispatch_callback(update: Update, context: CallbackContext) -> None:

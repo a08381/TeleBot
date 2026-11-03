@@ -1,4 +1,4 @@
-"""Microsoft 365 E5 renewal accounts and scheduled Graph activity."""
+"""E5 插件的命令、OAuth 回调与资源生命周期。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from core import (
+    WEBHOOK_BOT_KEY,
     Context,
     Keyboard,
     button,
@@ -22,14 +23,17 @@ from core import (
     startup,
     webhook_route,
 )
-from utils.e5_renewal import (
+from .e5_renewal import (
     E5_CALLBACK_PATH,
     E5RenewalError,
     RenewalResult,
     build_webhook_callback_uri,
     configure_e5_renewal,
     parse_authorization_callback,
+    store_call,
 )
+
+from utils.plugin_migration import migrate_default_data
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +45,7 @@ cfg = plugin_config({
     "max_consecutive_errors": 5,
     "request_concurrency": 3,
     "request_timeout": 20.0,
-    "database_path": "config/e5_accounts.sqlite3",
+    "database_path": "config/e5/e5_accounts.sqlite3",
     "redirect_uri": "",
 })
 
@@ -52,7 +56,7 @@ _SERVICE_SETTINGS = {
     "max_consecutive_errors": int(cfg.get("max_consecutive_errors", 5)),
     "request_concurrency": max(1, int(cfg.get("request_concurrency", 3))),
     "request_timeout": max(1.0, float(cfg.get("request_timeout", 20.0))),
-    "database_path": str(cfg.get("database_path") or "config/e5_accounts.sqlite3"),
+    "database_path": migrate_default_data(cfg, "database_path", "e5_accounts.sqlite3", sqlite=True),
 }
 
 
@@ -100,7 +104,7 @@ async def _store_call(
     ctx: Context, operation: Callable[..., Any], *args: Any, **kwargs: Any
 ) -> tuple[bool, Any]:
     try:
-        return True, await asyncio.to_thread(operation, *args, **kwargs)
+        return True, await store_call(operation, *args, **kwargs)
     except sqlite3.Error:
         logger.exception("E5 数据库操作失败: %s", getattr(operation, "__name__", operation))
         await ctx.reply_text("E5 本地数据库操作失败，请检查 Bot 日志。")
@@ -215,13 +219,13 @@ async def e5_oauth_callback(request: Any):
         return response("Missing or invalid OAuth state.", 400)
     state = states[0]
     try:
-        pending = await asyncio.to_thread(service.store.get_pending_by_state, state)
+        pending = await store_call(service.store.get_pending_by_state, state)
         if pending is None or not secrets.compare_digest(state, pending["state"]):
             return response("This authorization request is no longer valid.", 400)
         if _pending_is_expired(pending):
-            await asyncio.to_thread(service.store.delete_pending_by_state, state)
+            await store_call(service.store.delete_pending_by_state, state)
             await _notify_binding(
-                request.app["e5_telegram_bot"],
+                request.app[WEBHOOK_BOT_KEY],
                 int(pending["tg_user_id"]),
                 "E5 授权已超时，请重新执行 /e5bind。",
             )
@@ -229,10 +233,10 @@ async def e5_oauth_callback(request: Any):
 
         errors = query.getall("error_description", []) or query.getall("error", [])
         if errors:
-            await asyncio.to_thread(service.store.delete_pending_by_state, state)
+            await store_call(service.store.delete_pending_by_state, state)
             message = f"Microsoft 授权失败：{errors[0][:220]}"
             await _notify_binding(
-                request.app["e5_telegram_bot"], int(pending["tg_user_id"]), message
+                request.app[WEBHOOK_BOT_KEY], int(pending["tg_user_id"]), message
             )
             return response(message, 400)
 
@@ -245,7 +249,7 @@ async def e5_oauth_callback(request: Any):
         display_name = str(profile.get("displayName") or "").strip()
         principal = str(profile.get("userPrincipalName") or "").strip()
         alias = (display_name or principal or f"E5 {pending['client_id'][:8]}")[:80]
-        account = await asyncio.to_thread(
+        account = await store_call(
             service.store.add_account,
             tg_user_id=int(pending["tg_user_id"]),
             alias=alias,
@@ -254,11 +258,11 @@ async def e5_oauth_callback(request: Any):
             refresh_token=refresh_token,
             profile=profile,
         )
-        await asyncio.to_thread(service.store.delete_pending_by_state, state)
+        await store_call(service.store.delete_pending_by_state, state)
     except E5RenewalError as exc:
         logger.info("E5 OAuth 自动绑定失败: %s", exc)
         await _notify_binding(
-            request.app["e5_telegram_bot"],
+            request.app[WEBHOOK_BOT_KEY],
             int(pending["tg_user_id"]),
             f"Microsoft 授权绑定失败：{exc}",
         )
@@ -271,7 +275,7 @@ async def e5_oauth_callback(request: Any):
         return response("E5 authorization could not be completed. Check the bot logs.", 500)
 
     await _notify_binding(
-        request.app["e5_telegram_bot"],
+        request.app[WEBHOOK_BOT_KEY],
         account.tg_user_id,
         f"Microsoft 账户绑定成功：{account.alias}\n"
         f"Microsoft 账户：{account.display_name or account.user_principal_name or account.ms_user_id}\n"
@@ -364,11 +368,11 @@ async def e5_finish(ctx: Context, *args, **kwargs):
         _sync_service_settings()
         callback_url, alias = _parse_callback_url_and_alias(message.text)
         callback = parse_authorization_callback(callback_url, service.redirect_uri)
-        pending = await asyncio.to_thread(service.store.get_pending, _user_id(ctx))
+        pending = await store_call(service.store.get_pending, _user_id(ctx))
         if pending is None:
             raise E5RenewalError("找不到待完成的绑定，请重新执行 /e5bind")
         if _pending_is_expired(pending):
-            await asyncio.to_thread(
+            await store_call(
                 service.store.delete_pending_by_state, pending["state"]
             )
             raise E5RenewalError("授权已超时，请重新执行 /e5bind")
@@ -380,7 +384,7 @@ async def e5_finish(ctx: Context, *args, **kwargs):
         refresh_token, profile = await service.exchange_code(
             pending["client_id"], pending["client_secret"], callback.code
         )
-        account = await asyncio.to_thread(
+        account = await store_call(
             service.store.add_account,
             tg_user_id=_user_id(ctx),
             alias=alias,
@@ -389,7 +393,7 @@ async def e5_finish(ctx: Context, *args, **kwargs):
             refresh_token=refresh_token,
             profile=profile,
         )
-        await asyncio.to_thread(
+        await store_call(
             service.store.delete_pending_by_state, callback.state
         )
     except (E5RenewalError, ValueError, sqlite3.Error, OSError) as exc:
@@ -467,7 +471,7 @@ async def e5_unbind_account(ctx: Context, payload: str):
         return
 
     try:
-        removed = await asyncio.to_thread(
+        removed = await store_call(
             service.store.delete_owned_account, account_id, _user_id(ctx)
         )
     except sqlite3.Error:

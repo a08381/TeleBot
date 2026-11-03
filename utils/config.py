@@ -2,7 +2,7 @@
 
 这里只管 Bot 本体与基础设施（Token、API 地址、日志、webhook）。
 图站相关的业务参数（站点地址、UA、标签、图池大小、限流、浏览器指纹与 Cookie）
-属于使用它的插件，放 config/<插件名>.json，见 utils.plugin_config。
+属于使用它的插件，放 config/<插件名>/config.json，见 utils.plugin_config。
 
 config.json 里没写的字段用代码默认值，保证「不写配置 = 行为不变」。
 """
@@ -19,8 +19,20 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 CONFIG_FILE = BASE_DIR / "config.json"
 EXAMPLE_FILE = BASE_DIR / "config.example.json"
 
-# 机器人主人（/reload 等管理指令的白名单），改成你自己的 Telegram user id
-DEFAULT_OWNER_IDS = (535840409,)
+# 管理权限只来自部署者显式配置的 Telegram user id。
+DEFAULT_OWNER_IDS: tuple[int, ...] = ()
+
+
+def _as_bool(value: Any) -> bool:
+    """兼容 JSON 布尔值和常见字符串，避免把字符串 false 当成真。"""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "on"):
+            return True
+        if normalized in ("false", "0", "no", "off", ""):
+            return False
+        raise ValueError(f"无效的布尔配置值：{value!r}")
+    return bool(value)
 
 
 def _as_tuple_int(value: Any) -> tuple[int, ...]:
@@ -45,7 +57,7 @@ class WebhookSettings:
     def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "WebhookSettings":
         data = data or {}
         return cls(
-            enable=bool(data.get("enable", False)),
+            enable=_as_bool(data.get("enable", False)),
             url=str(data.get("url", "")).rstrip("/"),
             port=int(data.get("port", 7755)),
             path=str(data.get("path", "/")),
@@ -109,7 +121,7 @@ class BotSettings:
 
     这里只放「Bot 本体 + 基础设施」参数。
     具体图站（e621/e926）相关的配置属于使用它的插件，包括站点地址、UA、
-    浏览器指纹与 Cookie，全部放在 config/<插件名>.json 里（例如 config/yiff.json）。
+    浏览器指纹与 Cookie，全部放在 config/<插件名>/config.json 里（例如 config/yiff/config.json）。
     """
 
     telegram: TelegramSettings
@@ -126,10 +138,10 @@ class BotSettings:
         owner_ids = data.get("owner_ids", data.get("owner_id", DEFAULT_OWNER_IDS))
         return cls(
             telegram=TelegramSettings.from_mapping(data.get("telegram"), data),
-            owner_ids=_as_tuple_int(owner_ids) or DEFAULT_OWNER_IDS,
+            owner_ids=_as_tuple_int(owner_ids),
             log_level=str(data.get("log_level", cls.log_level)).upper(),
             log_dir=str(data.get("log_dir", cls.log_dir)),
-            log_split_streams=bool(data.get("log_split_streams", cls.log_split_streams)),
+            log_split_streams=_as_bool(data.get("log_split_streams", cls.log_split_streams)),
             log_format=str(data.get("log_format", cls.log_format)),
         )
 

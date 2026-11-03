@@ -1,411 +1,400 @@
 # TeleBot
 
-装饰器风格的 Telegram Bot 框架：插件只声明「我处理哪个指令」，
-框架负责解析、分发、生命周期管理；插件里看不到任何 `import telegram`。
+基于 `python-telegram-bot` 的异步 Telegram Bot。插件通过装饰器注册命令、按钮、生命周期钩子与 HTTP 回调；框架负责 Telegram 交互、分发和启动。内置 Warframe Market 账号/订单管理、Microsoft 365 E5 账户与定时 Graph 活动，以及图站媒体查询。
+
+支持长轮询与 webhook。插件通常只需导入 `core` 和 `utils`，不直接依赖 Telegram SDK。
 
 ## 快速开始
 
-```bash
-pip install -r requirements.txt
-cp config.example.json config.json   # 填好 t_token（owner_ids 建议改成你自己的 user id）
-python main.py                       # 默认长轮询；webhook.enable=true 时走 webhook
-```
+需要 **Python 3.10 或更高版本**，以及 Telegram Bot Token。依赖版本范围见 [requirements.txt](requirements.txt)。请从项目根目录执行下面的命令。
 
-过 Cloudflare 不需要额外起服务：装 `curl_cffi` 后填 `browser.impersonate`，
-请求就会带上与真实浏览器一致的 TLS/HTTP2 指纹（详见下文「过 Cloudflare」）。
+### 安装
+
+Linux / macOS：
 
 ```bash
-pip install curl_cffi
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp config.example.json config.json
 ```
 
-## 项目结构
+Windows PowerShell：
 
-```
-TeleBot/
-├── main.py                 入口：python main.py
-├── requirements.txt
-├── config.json             主配置（自己创建，不入库）
-├── config.example.json     主配置模板
-├── config/                 插件配置目录 —— 每个插件一份 json，插件自己生成
-│   ├── yiff.json           图站（e621/e926）相关参数全在这里
-│   └── ping.json  reload.json  whoami.json  wm.json
-├── core/                   框架层 —— 唯一 import python-telegram-bot 的地方
-│   ├── bot.py              Application 构建与启动（生命周期钩子）
-│   ├── dispatcher.py       指令/按钮注册表 + 解析 + 分发
-│   ├── loader.py           插件扫描、加载、热重载
-│   ├── context.py          Context / User / Chat / Message / CallbackQuery 门面
-│   ├── keyboard.py         Keyboard：链式构造内联键盘
-│   ├── plugin_config.py    插件私有配置（config/<插件名>.json）
-│   ├── errors.py           BotError（对 SDK 异常的统一包装）
-│   └── logging_setup.py    日志（控制台 + 按天切分）
-├── utils/                  通用工具层 —— 只依赖标准库 + httpx/curl_cffi，不依赖 core
-│   ├── config.py           主配置加载（全部参数带默认值）
-│   ├── browser_profile.py  浏览器指纹 + Cookie 配置、客户端工厂
-│   ├── http_pool.py        取图客户端单例（带浏览器指纹）
-│   ├── posts_pool.py       帖子预热池
-│   ├── wm_api.py           Warframe Market 客户端单例（鉴权 / 限流 / v1+v2 回退）
-│   └── wm_items.py         WM 物品索引与「黑话」解析
-└── plugins/                业务插件 —— 只 import core / utils
-    ├── ping.py  reload.py  whoami.py  wm.py  yiff.py
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item config.example.json config.json
 ```
 
-**两级配置**：Bot 本体与基础设施（Token、API 地址、主人 ID、日志、webhook）
-在根目录 `config.json`；业务参数（e621/e926 站点、UA、标签、图池、限流，以及浏览器
-指纹与 Cookie）在 `config/yiff.json`，由插件声明默认值后自动生成 ——
-主配置里没有一行图站相关的内容。
+编辑 [config.json](config.json)，填写 `telegram.token`。`owner_ids` 填你自己的 Telegram 数字用户 ID；默认空列表表示没有管理员。可以先在私聊中发送 `/whoami` 获取 ID，随后修改配置并重启。
 
-依赖方向单向：`plugins → core → utils`，utils 不反向依赖任何东西。
+### 初始化与启动
 
-## 写一个插件
+```bash
+# 可在填写 Bot Token 前执行，不连接 Telegram，也不启动后台任务
+python main.py --init-config
 
-在 `plugins/` 下新建 `.py` 文件即可，启动自动加载，无需注册。
+# 默认使用长轮询
+python main.py
 
-```python
-from core import Context, Keyboard, listener, button
-
-@listener("hello")                      # 处理 /hello
-async def hello(ctx: Context, *args, **kwargs):
-    await ctx.reply_text(f"hi, {ctx.user.full_name}")
-
-@button("demo:")                        # 处理 callback_data 以 demo: 开头的按钮
-async def demo(ctx: Context, payload: str):
-    await ctx.answer_query(f"你点了 {payload}")
+# 查看命令行参数
+python main.py --help
 ```
 
-指令支持 `/cmd arg1 k=v` 形式：`arg1` 进 `*args`，`k=v` 进 `**kwargs`；
-`/cmd@BotName` 只在 @ 了自己的时候才响应。
+PowerShell 中未激活虚拟环境时，将 `python` 换成 `.\.venv\Scripts\python.exe`。
 
-### Context 能做什么
+初始化会导入全部插件，生成 [config/yiff/config.json](config/yiff/config.json)、[config/wm/config.json](config/wm/config.json)、[config/e5/config.json](config/e5/config.json)，并创建 E5 的 SQLite 数据库。基础工具插件没有自己的配置文件。
 
-| 分类 | API |
-| --- | --- |
-| 读信息 | `ctx.user`（`.id` `.username` `.full_name` `.is_owner`）· `ctx.chat` · `ctx.message`（`.id` `.date` `.text`）· `ctx.query` · `ctx.args` / `ctx.kwargs` |
-| 发送 | `reply_text` · `reply_photo` · `reply_document` · `send_text` · `send_photo` · `send_document` |
-| 编辑 | `edit_photo` · `edit_document` |
-| 回调 | `answer_query(text=None, show_alert=False)` |
-| 逃生舱 | `ctx.bot` / `ctx.update`（拿到原始 PTB 对象，一般不需要） |
+正常启动会执行插件启动钩子：图站帖子池首次补充、WM 客户端与可选物品清单预热、E5 定时任务初始化。因此，启动阶段也可能访问配置的外部服务；`--init-config` 则不执行这些钩子。
 
-发送失败统一抛 `core.BotError`（插件不需要知道底层 SDK）。
-按钮用 `Keyboard()` 拼：`.url(text, url)` / `.callback(text, data)` / `.row()` 换行。
+## 主配置与部署
 
-### 插件自己的资源（startup / shutdown 钩子）
-
-插件要随进程启停的资源（连接池、后台任务），用钩子声明，框架在
-`post_init` / `post_shutdown` 阶段统一调用（取图客户端之后启动、之前停止）：
-
-```python
-from core import shutdown, startup
-from utils.posts_pool import PoolSettings, pool_start, pool_stop
-
-@startup
-async def _start_pool(application=None):     # 参数可以省略
-    await pool_start(PoolSettings.from_mapping(cfg.as_dict()))
-
-@shutdown
-async def _stop_pool(application=None):
-    await pool_stop()
-```
-
-注意：**实例要放 `utils/`（模块级单例），别放插件里** —— `/reload` 会重新导入
-`plugins.*`，写在插件模块里的状态热重载一次就没了。钩子本身只在进程启动时跑一次。
-
-### 插件自己的配置
-
-插件在代码里声明默认值，框架首次加载时自动在 `config/<插件名>.json` 生成文件，
-**不需要往根目录 config.json 里加字段**：
-
-```python
-from core import plugin_config
-
-cfg = plugin_config({          # 插件名自动取模块名：plugins/demo.py -> config/demo.json
-    "timeout": 10,
-    "vip_ids": [],
-})
-
-cfg.get("timeout")     # 读，也可用 cfg.timeout / cfg["timeout"]
-cfg.set("timeout", 30) # 改并立即落盘
-cfg.update(vip_ids=[1, 2])
-cfg.reload()           # 重新读盘（/reload 时会自动做）
-cfg.reset()            # 恢复默认值
-```
-
-文件行为：
-
-| 情况 | 处理 |
-| --- | --- |
-| 文件不存在 | 用默认值生成一份 |
-| 文件缺字段 | 补上默认值并写回 |
-| 文件多出字段 | 保留，不删 |
-| 类型不对（如填了 `"3"` 而默认是 `3`） | 按默认值类型强转，转不过来回退默认值 |
-
-不想启动机器人就想把配置生成出来：`python main.py --init-config`。
-`config/*.json` 已在 .gitignore 里，不会进版本库。
-
-## 热重载
-
-`/reload`（仅 `owner_ids` 里的用户可用）会清空注册表、卸载 `plugins.*` 模块并重新导入。
-因此**跨重载需要保留的单例要放 `utils/`**（`http_pool` / `posts_pool` 就是这么做的），
-插件模块级的缓存会随重载一起重置。
-
-## 配置
-
-根目录 `config.json`（主配置，模板见 `config.example.json`）：
+主配置仅包含 Telegram、管理员与日志设置。完整模板见 [config.example.json](config.example.json)。
 
 ```json
 {
   "telegram": {
-    "token": "123456:ABC...",
+    "token": "填写 Bot Token",
     "host": "https://api.telegram.org",
     "webhook": {
-      "enable": false, "url": "", "port": 7755, "path": "/",
+      "enable": false,
+      "url": "",
+      "port": 7755,
+      "path": "/telegram",
       "secret_token": ""
     }
   },
-  "owner_ids": [535840409],
+  "owner_ids": [],
   "log_level": "INFO",
-  "log_dir": "logs"
+  "log_dir": "logs",
+  "log_split_streams": true,
+  "log_format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 }
 ```
 
-`telegram.host` 只在用自建 API / 反代时改，`webhook.enable=false` 走长轮询（默认）。
-`webhook.secret_token` 可选；启用时 Telegram webhook 会校验请求头中的 secret token。
-**不含任何图站参数**。没写的字段一律用代码默认值。
-
-旧格式的顶层 `t_token` / `t_host` / `webhook` 仍能读，自动兜底（telegram 段优先），
-迁移时不用一次性改完。
-
-这些都是通用调参，**默认即可**，看不懂就不用动。
-
-`config/yiff.json`（e621/e926 全部参数，运行时自动生成）：
-
-| 字段 | 说明 |
+| 配置项 | 行为 |
 | --- | --- |
-| `site` | 站点地址，如 `https://e926.net` / `https://e621.net` |
-| `default_tags` | 不带参数时的默认标签 |
-| `user_agent` | 站点要求的合规 UA（e621 禁浏览器 UA，需带用户名） |
-| `browser.impersonate` | **浏览器指纹**：`chrome124` / `chrome` / `firefox135` / `safari184`…，留空=不启用 |
-| `browser.sync_ua` | 启用指纹时，用浏览器 UA 覆盖上面的 `user_agent`（默认 `true`） |
-| `browser.cookies` / `browser.cookie` | 站点 Cookie：dict 或 `"a=1; b=2"` 字符串（登录态、手填的 cf_clearance） |
-| `browser.cookie_domains` | 额外要发 Cookie 的域名（图片在 CDN 子域时填它） |
-| `browser.timeout` | 单次请求超时（秒，默认 20） |
-| `pool.size` | 预热池容量 |
-| `pool.low_water` | 低于此数量开始补货 |
-| `pool.refill_interval` | 补货检查间隔（秒） |
-| `pool.min_interval` | 请求最小间隔，e621 限 2 req/s，建议 >=1.1 |
-| `pool.cache_ttl` | 搜索结果缓存时长（秒） |
-| `upload_limit_mb` | 自下载后上传的体积上限 |
-| `photo_exts` | 走 photo（而非 document）的扩展名 |
-| `enable_next_button` | 是否挂「换一张」按钮 |
-| `caption` | 图片说明，支持 `{id}` |
+| `telegram.token` | 必填，由 BotFather 创建 Bot 后取得 |
+| `telegram.host` | Telegram Bot API 根地址；自建 API 服务或反向代理时修改 |
+| `telegram.webhook.enable` | `false` 使用长轮询，`true` 使用项目内置 aiohttp 监听器 |
+| `telegram.webhook.url` | 外部 HTTPS 地址；与内置 E5 回调配合时使用主机根地址，例如 `https://bot.example.com` |
+| `telegram.webhook.port` | 内部 HTTP 监听端口，默认 `7755`；监听 `0.0.0.0` |
+| `telegram.webhook.path` | Telegram 更新路径，默认 `/`；示例使用 `/telegram`，不得与插件路由冲突 |
+| `telegram.webhook.secret_token` | 可选，校验 Telegram 的 `X-Telegram-Bot-Api-Secret-Token` 请求头 |
+| `owner_ids` | 管理员 ID 数组；未配置或显式设为 `[]` 时不授予管理员权限 |
+| `log_level` / `log_dir` | 日志级别和目录；相对日志路径基于项目根目录 |
+| `log_split_streams` | 默认将低于 WARNING 的日志写入 stdout，WARNING 及以上写入 stderr |
 
-`pool` 段只填部分字段也没关系，缺的会按默认值补齐（嵌套配置同样支持）。
+日志写入 [logs/telebot.log](logs/telebot.log)，按天轮转，最多保留 10 份备份。文件和控制台都受 `log_level` 过滤。根配置启动后会缓存，修改后需要重启。
 
-其它插件的 `config/<插件名>.json`：
+兼容旧配置中的顶层 `t_token`、`t_host`、`webhook` 和 `owner_id`；优先使用新 `telegram` 段中填写的值。旧配置中显式填写的管理员 ID 会继续生效。
 
-| 插件 | 可配项 |
+### webhook
+
+将 `enable` 设为 `true`，填写外部 HTTPS 地址与内部端口。内置服务不处理 TLS，需由反向代理完成 HTTPS 终止，并把请求转发到 Bot 的 HTTP 端口。
+
+使用上述 `/telegram` 配置时，应同时转发：
+
+| 外部请求 | 用途 |
 | --- | --- |
-| ping | `precision` 小数位 · `suffix` 单位后缀 |
-| whoami | `template` 文案模板（`{id}` `{username}` `{full_name}`）· `show_full_name` |
-| wm | `prompt` 提示语 · `per_row` 每行按钮数 · `options` 按钮列表 |
-| reload | `extra_owner_ids` 额外管理员 · `message` 回执文案 |
+| `POST https://bot.example.com/telegram` | Telegram 更新 |
+| `GET https://bot.example.com/e5/callback` | E5 OAuth 自动回调 |
 
-改完插件配置执行 `/reload` 即可生效；唯一例外是 `site` 与 `pool.*` ——
-图池在进程启动时按这些参数建好了，改它们需要重启进程。
+Telegram 更新会先校验 secret、Content-Type、JSON 和 `update_id`，再进入 Application 更新队列。E5 回调独立校验 OAuth state，不使用 Telegram webhook secret。内置 HTTP 服务关闭访问日志；反向代理也应避免记录带授权码的完整回调 URL。
 
-`user_agent` 与 `browser.*` 改完 `/reload` 也能生效：`http()` 发现站点或浏览器身份
-变了会自动关掉旧客户端、按新参数重建。
+长轮询模式不启动 HTTP 监听器，E5 使用手动完成授权的流程。
 
-### 过 Cloudflare：浏览器指纹 + Cookie
+## 内置命令
 
-Cloudflare 看两样东西：**TLS/HTTP2 指纹** 与 **Cookie**。前者是硬门槛 ——
-httpx 的握手形状一看就是脚本，还没轮到看 Cookie 就被 403 了。所以：
+### 基础工具
 
-```bash
-pip install curl_cffi
-```
+| 命令 | 功能与权限 |
+| --- | --- |
+| `/ping` | 输出本机当前时间与 Telegram 消息时间戳的差值，单位秒；不是网络 RTT 测试 |
+| `/whoami` | 将用户 ID、username、姓名发送到发起者私聊；先与 Bot 建立私聊 |
+| `/check [参数 ...] [k=v ...]` | 回显分发器解析的位置参数和键值参数 |
+| `/reload` | 仅管理员，重新加载所有插件并返回成功加载数量 |
 
-然后在 `config/yiff.json` 里配 `browser` 段：
+### Warframe Market
 
-```jsonc
-"browser": {
-  "impersonate": "chrome124",          // 留空=不启用指纹
-  "sync_ua": true,                     // 用浏览器 UA 覆盖站点 UA（CF 会交叉验证两者）
-  "cookies": { "login": "xxx" },       // 站点 Cookie，或 "cookie": "a=1; b=2"
-  "cookie_domains": [],                // 额外要发 Cookie 的域名（CDN 子域）
-  "headers": {},
-  "timeout": 20.0
-}
-```
+公开查价无需登录。绑定会话按 Telegram 用户 ID 保存，操作自己的账号；若多个 Telegram 用户绑定同一个 WM 账号，远端操作仍会相互影响。
 
-- 装没装 curl_cffi 都能跑：没装时自动退回 httpx 并打一条 warning，功能不受影响，
-  只是没有指纹（`/fp` 会显示"未生效"）
-- Cookie 只发给站点主域 + `cookie_domains`，不会泄漏给 CDN / 第三方域
-- 改完 `/reload` 生效，图池不用重建 —— 它每次取图都现调 `http()`
-- **注意冲突**：e621/e926 要求 UA 带用户名且不许用浏览器 UA，而过 CF 必须用浏览器
-  UA，二选一（见 `config/README.md`）
+| 命令 | 功能与权限 |
+| --- | --- |
+| `/wm` | 打开账号与订单管理面板 |
+| `/wm online\|ingame\|invisible\|offline` | 设置自己的状态 |
+| `/wmstatus [状态]` | 查询或设置自己的状态，需要已绑定账号 |
+| `/wmlogin <邮箱> <密码>` | 绑定自己的 WM 账号，默认允许普通用户使用；请在私聊中操作 |
+| `/wmlogin` | 仅管理员，使用配置中的预设账号绑定 |
+| `/wmlogout [TG用户ID]` | 默认解绑自己；指定用户需要管理员权限且配置允许 |
+| `/wmwho` | 普通用户查看自己，管理员查看全部绑定 |
+| `/wmitems [页码]` | 分页查看自己的卖单，包括隐藏卖单；命令参数从 `0` 开始，界面页码从 `1` 开始；也支持 `page=N` |
+| `/wmvisible` | 立即把自己的全部隐藏订单设为可见，包含买单和卖单，没有二次确认 |
+| `/wmreprice` | 预览可见卖单改价计划，点击确认后执行 |
+| `/price <物品> [platform=pc] [crossplay=false] [rank=5]` | 公开查价；别名 `/wmprice`，也接受 `plat`、`r` 参数 |
+| `/wmrefresh` | 仅管理员，强制刷新物品清单与名称索引 |
+| `/wmdiag` | 仅管理员，检查接口；已绑定时还会将账号设为 online 并保持连接，不是纯只读检查 |
 
-> **为什么放在插件配置**：`site` / `user_agent` / 浏览器身份描述的都是
-> 「访问哪个站、以什么身份」，同一个进程里可能有多个插件访问不同站点，
-> 所以它们跟着插件走，主配置只留 Bot 本体那几项。
-
-`/fp`（仅主人）可以随时查看当前指纹、Cookie 名与实际发出的 UA。
-
-## Warframe Market 插件（wm）
-
-登录 WM 账号、改在线状态、查物品价格（支持玩家黑话）。
-
-**一个 Telegram user id 绑定一个 WM 账号**：A 改状态不会动到 B 的账号，
-会话按 user id 分开存在 `config/wm_sessions.json`（权限 0600）。
+查价支持名称、slug、昵称、Prime/部位后缀和等级。解析先尝试 `aliases`，再尝试官方名称、组合名称与模糊候选；中文匹配取决于上游物品清单包含的名称。多个候选时通过按钮选择。
 
 ```text
-/wm                                 面板：自己绑定的账号 + 状态按钮
-/wm online|ingame|invisible|offline  改**自己**账号的状态
-/wmstatus [状态]                     查看 / 改自己账号的状态
-/wmlogin [邮箱 密码]                  绑定（不带参数 = 主人用 config/wm.json 里的账号）
-/wmlogout [tg用户id]                 解绑（不带参数 = 解绑自己；带 id 需主人权限）
-/wmwho                              查看已绑定了哪些账号（主人看全部，其他人只看自己）
-/wmitems [页码]                      分页查看自己的卖单和参考价
-/wmvisible                           一键将自己全部隐藏订单设为可见（卖单和买单）
-/wmreprice                           预览并批量改价自己的可见卖单（匹配最低竞争卖价）
-/price <物品> [platform=ps4] [crossplay=true] [rank=5]
-/wmrefresh                           强制刷新物品清单（主人）
-/wmdiag                              逐个试探端点，看接口现状（主人）
+/price nikana prime set
+/price 充沛 rank=5
+/price 满级优雅
+/price volt prime set platform=pc crossplay=true
+/wmitems 0
 ```
 
-`/wmitems` 可通过 `/wm` 面板或指令打开，展示当前挂单价、排除自己挂单后的最低/次低卖价，以及近 48 小时最新小时的成交中位统计；Mod/赋能会按等级区分。统计接口提供的是小时聚合值，并非单笔成交明细。列表可通过按钮翻页，每条卖单也有「匹配最低价」快捷按钮，并提供「全部订单设为可见」按钮。
+改价目标是排除自己的订单后、符合等级与在线筛选条件的最低竞争卖价，**既可能降价，也可能涨价**，不是自动减 1。计划有效期 10 分钟，一次性使用；确认时重新检查自己的订单与市场价，预览后发生变化的项目会跳过。仅处理可见卖单，不包含持续自动改价任务，也不创建或删除订单。统计展示的是上游最新时间桶的聚合数据，不是单笔成交。
 
-`/wmreprice` 只处理当前可见的卖单，按每个物品/等级匹配最低竞争卖价，并先展示预览；点击确认后逐条更新，挂单在预览后已变化的会跳过，单条失败会在结果中列出。市场参考价沿用 `price.only_online` 设置，并排除自己的所有挂单。
+主要配置见自动生成的 [config/wm/config.json](config/wm/config.json)：
 
-`/wmvisible` 或 `/wm` / `/wmitems` 上的「全部订单设为可见」按钮，会将当前账号所有隐藏订单（包括买单和卖单）逐个设为可见，并汇报成功与失败数量。
-
-黑话例子：
-
-```text
-/price 满级充沛          -> Arcane Energize，只统计 rank 5
-/price 咖喱p             -> Excalibur Prime Set
-/price 咖喱p 图纸         -> Excalibur Prime Blueprint
-/price 咖喱p 总图         -> Excalibur Prime Blueprint
-/price 电男p 机体         -> Volt Prime Chassis
-/price DJp               -> Octavia Prime Set
-/price 主教p              -> Harrow Prime Set
-/price 蝶妹p              -> Titania Prime Set
-/price 双子               -> Sirius & Orion
-/price 蜘蛛甲             -> Oraxia
-/price 狼甲p              -> Voruna Prime Set
-/price 满级优雅            -> Arcane Grace，按满级过滤
-/price nikana prime set platform=xbox crossplay=true
-```
-
-解析顺序：**官方中英文名**（物品清单自带 i18n，中文官方名天然命中）→
-**黑话词典**（`config/wm.json` 的 `aliases`）→ **关键字模糊匹配**（多个候选时给按钮让你选，
-不替你猜唯一解）。黑话词典只放官方名解释不了的昵称，可自行增删：
-
-```jsonc
-"aliases": {
-  "咖喱": "excalibur",     // 值是不带 _prime / _set 的**物品基名**
-  "充沛": "arcane_energize",
-  "主教": "harrow",
-  "蝶妹": "titania",
-  "双子": "sirius_and_orion"
-}
-```
-
-自动识别的后缀：`p` / `prime` / `圣装` → `_prime`；`套装` / `set` → `_set`；
-`图纸` / `bp` / `总图` → `_blueprint`；机体 / 系统 / 神经光元 / 刀刃 / 枪管… → 对应 part。
-等级支持 `满级`、`r3`、`3级`、`rank=3`；Mod / Arcane 不指定等级时会按等级分组列出。
-
-### 配置（config/wm.json）
-
-| 字段 | 说明 |
+| 配置项 | 默认值 / 说明 |
 | --- | --- |
-| `account.email` / `account.password` | 主人的 WM 账号；**建议填这里**，别在聊天里打密码 |
-| `account.user_id` | 主人账号绑到哪个 tg 用户；`0` = 自动取 `owner_ids` 第一个 |
-| `autologin` | 启动时自动把上面的账号绑过去（该用户已绑过则跳过） |
-| `bind.allow_all` | 是否允许普通用户绑定**自己**的账号（默认 `true`；`false` = 只有主人能绑） |
-| `bind.owner_can_unbind_all` | 主人能否 `/wmlogout <tg用户id>` 解绑别人（默认 `true`） |
-| `platform` / `crossplay` / `language` | 订单口径，默认 `pc` / `false` / `en` |
-| `user_agent` | 官方 Rules 要求必须能标识你的应用 |
-| `browser.*` | 被 Cloudflare 拦时填 `impersonate`（需 `pip install curl_cffi`）与 Cookie |
-| `rate_limit.rps` | 官方公共限流 **3 RPS**，别调高（多账号共享同一个桶） |
-| `cache.items_ttl` / `orders_ttl` | 物品清单 24h、订单 60s（官方要求必须缓存） |
-| `api.timeout` | HTTP 与状态 WebSocket 连接/响应超时 |
-| `price.only_online` | 只统计 online / ingame 的挂单（默认 `true`） |
-| `price.group_by_rank` | Mod / Arcane 未指定等级时按等级分组 |
-| `session_file` | 会话库：`{tg用户id -> 账号}`，含 JWT，权限 0600 |
+| `account.email` / `account.password` | 空；可预设管理员账号 |
+| `account.user_id` | `0`，使用 `owner_ids` 中第一个用户 |
+| `autologin` | `true`，启动时仅在目标用户尚未绑定时自动登录 |
+| `bind.allow_all` | `true`，设为 `false` 后仅管理员可绑定 |
+| `bind.owner_can_unbind_all` | `true`，允许管理员指定用户解绑 |
+| `platform` / `crossplay` / `language` | `pc` / `false` / `en` |
+| `rate_limit.rps` / `rate_limit.burst` | `3` / `3`，多个账号共享限流器 |
+| `cache.items_ttl` / `cache.orders_ttl` | `86400` / `60` 秒；名称索引不是定时自动刷新，使用 `/wmrefresh` 更新 |
+| `api.timeout` | `20` 秒，HTTP 和状态 WebSocket 使用此值 |
+| `price.only_online` / `price.top_n` | `true` / `5`，默认只统计 online、ingame 的可见订单 |
+| `my_listings.page_size` | `8`，有效范围 1–20 |
+| `session_file` | `config/wm/wm_sessions.json`；默认位置按项目根目录定位，自定义相对路径基于进程当前工作目录 |
+| `aliases` | 内置昵称映射，可自行扩展 |
+| `browser` | HTTP 请求的浏览器指纹、Cookie、代理等选项，不等于状态 WebSocket 配置 |
 
-旧配置中的 `status_write.mode = "off"` 仍可用来禁用状态切换；`auto` / `v1` / `v2`
-不再切换写入协议，状态统一通过 WebSocket 设置。
+登录与部分读取包含 v1/v2 回退；自己的订单使用 v2 `/orders/my`，修改使用 v2 `/order/{id}`。外部接口是否可用取决于 WM 服务端，代码中的回退不保证所有接口始终可用。
 
-多账号模型（为什么这样设计）：
+online、ingame、invisible 通过 `wss://warframe.market/socket-v2` 为各用户保持独立连接。offline 关闭本 Bot 的对应连接，不保证其他客户端会话也离线。重启、断网或客户端配置重建后没有自动恢复在线连接的后台机制，需要重新设置状态。旧 `status_write.mode=off` 可关闭常规状态切换，但 `/wmdiag` 仍会直接检查在线连接。
 
-```text
-WMClient（单例：连接池 + 限流器 + 公开数据缓存）
-  └── SessionStore: {tg_user_id -> WMSession}
-```
+### Microsoft 365 E5
 
-客户端自己**不持有**任何账号状态，所有需要登录的接口都必须显式传 `session`。
-这样不会出现"单例里最后一个 token 覆盖所有人"的经典坑 ——
-每个指令按**发起者**（按钮则按点击者）取自己的账号。
-公开数据（清单 / 订单 / 统计）全局共享缓存，不区分账号。
+通过 Microsoft OAuth 绑定账户，定时刷新 access token 并调用 Graph `/me/messages?$top=1&$select=id`。只请求最多一个邮件 ID，不读取或保存邮件正文，也不发送邮件。**Graph 活动成功不代表开发者订阅一定续订。**
 
-### 状态语义与 WebSocket 状态连接
-
-官方 FAQ：`ingame` 可交易，`online` 约 1 小时内可交易，`invisible` 不可交易；
-状态写入使用 `wss://warframe.market/socket-v2`：选择 online / ingame / invisible
-时，客户端会为该绑定账号认证并保持独立的 WebSocket 连接；选择 `offline` 或解绑时关闭连接，
-由 WM 将账号状态更新为离线。
-
-状态变更等待 WebSocket 服务端确认；连接在运行期间由客户端心跳维持，进程退出或网络断开时，
-WM 会按断连处理。
-
-### API 现状（重要）
-
-WM 的新 API 合同仍 **< 1.0，随时可能破坏性变更**，官方明确 v1 已弃用但 OAuth 2.0 未开放、
-需要授权的集成仍要走 v1 授权流程。所以这里是「v1 登录 + v2 读数据 + WebSocket 写状态」：
-
-| 用途 | 端点 |
-| --- | --- |
-| 登录 | `POST /v1/auth/signin`（凭证从响应头 `Authorization: JWT ...` 取） |
-| 当前用户 | `GET /v2/me` |
-| 订单 | `GET /v2/orders/item/{slug}`（公开，无需登录） |
-| 物品清单 | `GET /v1/items`，失败回退 `/v2/items` |
-| 历史统计 | `GET /v1/items/{slug}/statistics`（可选，挂了就自动省略） |
-
-`/wmdiag`（仅主人）会逐个试探这些端点并打印结果 —— 接口变了先看它。
-
-## Microsoft 365 E5 续订插件（e5）
-
-参考项目的定位不同：
-
-- [Musicminion/e5](https://github.com/Musicminion/e5) 是独立部署的 Spring Boot 网站服务，提供 GitHub OAuth 用户登录、Outlook 账户授权与续订任务管理，并使用 MySQL、Redis、InfluxDB 和定时任务组件。它面向网页部署，不是 Telegram 插件。
-- [iyear/E5SubBot](https://github.com/iyear/E5SubBot) 是 Telegram Bot：用户绑定自己的 Microsoft 应用和账户授权，Bot 定时调用 Microsoft Graph 的 Outlook 邮件读取接口，并提供账户查询、解绑、任务结果通知和管理员手动执行。
-
-本项目按 E5SubBot 的 Bot 工作流实现了轻量插件：使用 Microsoft OAuth 授权码绑定账户、保存轮换后的 refresh token、周期性读取 `/me/messages`、向账户所有者汇报结果，并支持查看/解绑账户及主人手动执行全局任务。续订效果取决于 Microsoft 账户和开发者订阅状态，Graph API 活动不保证续订。
-
-首次加载后会生成 `config/e5.json`。主要选项：
-
-| 配置项 | 说明 | 默认值 |
-| --- | --- | --- |
-| `scheduler_enabled` | 是否启用后台定时任务 | `true` |
-| `interval_hours` | 任务间隔（小时） | `24` |
-| `max_accounts_per_user` | 每个 Telegram 用户的绑定上限 | `5` |
-| `max_consecutive_errors` | 连续失败达到上限后暂停账户；设为 `0` 或负数不自动暂停 | `5` |
-| `request_concurrency` | Graph 请求并发数 | `3` |
-| `request_timeout` | 单次 HTTP 请求超时（秒） | `20` |
-| `database_path` | OAuth 凭据与账户数据的 SQLite 路径 | `config/e5_accounts.sqlite3` |
-| `redirect_uri` | Microsoft 应用注册及授权时使用的回调 URI，必须一致；webhook 模式留空时自动使用 `https://<webhook.url>/e5/callback` | 空 |
-
-在 Microsoft Entra 中注册应用并创建 client secret，配置与 `redirect_uri` 完全一致的回调 URI，并授予 delegated `User.Read`、`Mail.Read` 权限。webhook 模式下，E5 回调与 Telegram webhook 共用 `telegram.webhook.port`，回调路径固定为 `/e5/callback`；`telegram.webhook.url` 应是外部 HTTPS 主机地址，反向代理需将该主机的 Telegram webhook 路径和 `/e5/callback` 都转发到同一端口。可选配置 `telegram.webhook.secret_token` 后，Telegram 更新请求会校验 `X-Telegram-Bot-Api-Secret-Token`。授权码由 Bot 服务端使用 client secret 兑换，OAuth 回调不会写入访问日志。
-
-webhook 模式下浏览器授权成功后会自动完成绑定，账户别名使用 Microsoft 显示名称；`/e5finish` 仍可在轮询模式或回调服务不可达时手动完成。`/e5bind` 命令包含 client secret，只能在 Bot 私聊中发送。
+1. 在 Microsoft Entra 注册应用，创建 client secret，配置 Web 回调 URI，以及 delegated `User.Read`、`Mail.Read` 权限。插件授权时还请求 `openid`、`offline_access`。
+2. webhook 模式下，`redirect_uri` 留空时使用 `https://你的域名/e5/callback`；确保 Microsoft 应用中登记的 URI 完全一致，且反向代理已转发该路径。
+3. 在 Bot 私聊中执行 `/e5bind`，打开授权链接。webhook 模式自动完成绑定；轮询模式使用完整回调 URL 手动执行 `/e5finish`。
 
 ```text
 /e5bind <client_id> <client_secret>
-# 点击授权链接并登录对应账户
-# webhook 模式由回调自动绑定；轮询模式手动粘贴回调地址：
-/e5finish <浏览器完整回调地址> <账户别名>
+/e5finish <完整回调URL> <账户别名>
 /e5accounts
 /e5unbind
 ```
 
-其他指令：`/e5help` 查看帮助，`/e5cancel` 取消等待中的绑定，`/e5run` 由 `owner_ids` 中的主人手动执行全部已启用账户。绑定、账户信息和解绑仅允许私聊；连续失败到达阈值的账户会暂停而不会被删除。数据库文件已加入 `.gitignore`，包含应用密钥和 refresh token，应按敏感凭据保护并纳入自己的备份策略；Windows 部署请限制该文件的访问 ACL。
+轮询模式下，空 `redirect_uri` 使用 `http://localhost/e5sub`。项目不会启动该 localhost 服务；授权后即使浏览器显示连接失败，也可以从地址栏复制带 `code`、`state` 的完整地址交给 `/e5finish`。自定义 URI 同样必须与应用注册配置一致。
+
+| 命令 | 功能与权限 |
+| --- | --- |
+| `/e5help` | 查看帮助与当前有效回调地址 |
+| `/e5bind <client_id> <client_secret>` | 私聊，开始绑定；每用户只有一个待完成绑定，新请求替换旧请求，有效期 15 分钟 |
+| `/e5finish <完整回调URL> <账户别名>` | 私聊，手动完成绑定；别名可含空格，长度 1–80 |
+| `/e5accounts` | 私聊，查看自己的账户、最近成功时间与失败次数 |
+| `/e5unbind` | 私聊，通过按钮选择并删除自己的账户 |
+| `/e5cancel` | 私聊，取消自己尚未完成的绑定 |
+| `/e5run` | 管理员且私聊，立即执行全部已启用账户，并通知各账户所有者 |
+
+主要配置见 [config/e5/config.json](config/e5/config.json)：
+
+| 配置项 | 默认值 / 说明 |
+| --- | --- |
+| `scheduler_enabled` | `true` |
+| `interval_hours` | `24`，启动后先等待一个完整周期，再首次执行；不是固定钟点任务 |
+| `max_accounts_per_user` | `5` |
+| `max_consecutive_errors` | `5`，达到后暂停账户；设为 `0` 或负数不自动暂停 |
+| `request_concurrency` / `request_timeout` | `3` / `20` 秒 |
+| `database_path` | `config/e5/e5_accounts.sqlite3`，相对路径基于项目根目录 |
+| `redirect_uri` | 空，按当前运行模式推导 |
+
+同一 Telegram 用户与同一 `client_id` 只允许一条账户记录。连续失败后账户暂停但不删除；当前没有单独恢复命令，处理授权问题后可解绑重绑。`/e5run` 不执行已暂停账户。
+
+应用密钥、refresh token、账户和待绑定状态保存在本地明文 SQLite 中；含密钥的 `/e5bind` 消息也不会自动删除。请保护配置、数据库及备份；Windows 上需单独设置文件 ACL。
+
+### 图站媒体查询
+
+| 命令 | 功能与权限 |
+| --- | --- |
+| `/yiff [标签 ...]` | 按标签查询媒体，不带位置参数时使用 `default_tags` |
+| `/fp`、`/yiff_fp` | 仅管理员，显示站点、实际 UA、指纹状态和 Cookie 名称，不显示 Cookie 值 |
+
+配置见 [config/yiff/config.json](config/yiff/config.json)。默认站点为 `https://e621.net`，可按需要改为 `https://e926.net`。请自行检查生成的 `default_tags` 与目标站点内容设置。
+
+| 配置项 | 默认值 / 说明 |
+| --- | --- |
+| `site` / `default_tags` | 站点地址与无参数查询时的标签 |
+| `user_agent` | 标识应用的 UA，可填写自己的应用与联系方式 |
+| `pool.size` / `pool.low_water` | `40` / `10`，池内保存帖子元数据，不预下载媒体文件 |
+| `pool.refill_interval` / `pool.min_interval` | `30` / `1.1` 秒 |
+| `pool.cache_ttl` | `300` 秒 |
+| `upload_limit_mb` | `20`，仅检查本机下载后的上传回退，不是下载流量或内存占用的硬上限 |
+| `enable_next_button` | `true`，启用换图按钮 |
+| `caption` | `帖子 {id}` |
+| `browser` | 浏览器指纹、Cookie、UA、代理、超时等 HTTP 选项 |
+
+首次发送依次尝试 photo URL、document URL、下载后上传；photo 尝试受 `photo_exts` 限制。换图编辑没有同样的完整回退流程，按钮也不限制为原请求者点击。换图记录保存在插件内存中，重载或重启后旧按钮可能失效。
+
+当前非空标签查询走搜索缓存/请求路径，只有空标签才消费预热队列，因此默认调用不保证直接从预热池取出结果。
+
+`browser.impersonate` 非空时尝试使用 `curl_cffi`；为空或该依赖未安装时使用 httpx。依赖清单已包含 `curl_cffi`。这只是 HTTP 客户端能力，不保证通过站点挑战或取得登录权限。`browser.cookie` 字符串与 `browser.cookies` 字典会合并，同名时字符串覆盖；Cookie 按站点域和显式配置的额外域注入。
+
+## 插件开发与项目结构
+
+```text
+TeleBot/
+├── main.py                  命令行入口
+├── config.example.json      主配置模板
+├── requirements.txt         运行依赖
+├── core/
+│   ├── bot.py               配置、插件、分发器的装配与启动
+│   ├── server.py            webhook HTTP 服务与 Application 启停
+│   ├── dispatcher.py        命令/按钮注册、解析与分发
+│   ├── loader.py            顶层入口扫描、整包导入与卸载
+│   ├── runtime.py           调用登记与重载互斥
+│   ├── lifecycle.py         插件启动/停止钩子
+│   ├── webhook.py           插件 GET 路由与共享 Bot 键
+│   ├── context.py           Telegram 上下文门面
+│   ├── keyboard.py          内联键盘构造器
+│   ├── errors.py            BotError
+│   └── logging_setup.py     日志配置
+├── plugins/
+│   ├── check.py / ping.py / whoami.py / reload.py
+│   ├── e5/
+│   │   ├── __init__.py      包入口，setup() 导入同名处理器
+│   │   ├── e5.py            指令、OAuth 回调与生命周期
+│   │   └── e5_renewal.py    SQLite、OAuth 与定时任务
+│   ├── wm/
+│   │   ├── __init__.py
+│   │   ├── wm.py            指令、按钮与生命周期
+│   │   ├── wm_api.py        HTTP、WebSocket、会话与缓存
+│   │   └── wm_items.py      名称索引与物品查询
+│   └── yiff/
+│       ├── __init__.py
+│       ├── yiff.py          指令、按钮与生命周期
+│       ├── http_pool.py     图站私有 HTTP 客户端
+│       └── posts_pool.py    帖子池与搜索缓存
+├── utils/                   共享配置与 browser_profile HTTP 客户端工厂
+├── config/
+│   ├── e5/
+│   │   ├── config.json
+│   │   └── e5_accounts.sqlite3
+│   ├── wm/
+│   │   ├── config.json
+│   │   └── wm_sessions.json
+│   └── yiff/
+│       └── config.json
+└── tests/                   单元测试与隔离插件重载测试
+```
+
+### 单文件与插件包
+
+加载器只扫描 [plugins/](plugins/) 顶层入口，同时支持单文件插件和带有包入口的插件目录；以下划线开头的顶层模块会跳过。包内工具、测试和子包不会自动递归导入，由入口或处理器按需引用。同一插件名应只选择一种布局，避免单文件与同名包并存。
+
+简单插件可以直接保存为 [plugins/hello.py](plugins/hello.py)：
+
+```python
+from core import Context, Keyboard, button, listener, plugin_config
+
+cfg = plugin_config({"greeting": "你好"})
+
+
+@listener("hello")
+async def hello(ctx: Context, *args, **kwargs):
+    name = ctx.user.full_name if ctx.user else "访客"
+    keyboard = Keyboard().callback("打招呼", "hello:again")
+    await ctx.reply_text(f"{cfg.greeting}，{name}", reply_markup=keyboard)
+
+
+@button("hello:")
+async def hello_button(ctx: Context, payload: str):
+    await ctx.answer_query(f"收到：{payload}")
+```
+
+需要私有工具时，将上面的处理器放到 [plugins/hello/hello.py](plugins/hello/hello.py)，并增加 [plugins/hello/__init__.py](plugins/hello/__init__.py)：
+
+```python
+def setup() -> None:
+    from . import hello  # 导入时注册命令、按钮及生命周期钩子
+```
+
+`setup()` 是可选的同步入口，每轮加载只执行一次；异步初始化放在 `@startup` 中。也可以直接在包入口注册处理器，但内置三个插件使用延迟导入，单独导入私有工具时不会顺带注册指令或生成配置、数据库。
+
+私有工具与服务放在同一个插件目录中，通过 `from . import client` 等相对导入引用；更深的工具子包同样支持。不要在 `core`、共享 `utils` 或其他长生命周期对象中保留插件工具的引用，否则删除模块缓存后这些外部引用仍可能指向旧对象。真正共享的配置工具、客户端工厂继续放在 `utils`。
+
+### 框架接口
+
+命令按空白拆分参数，`key=value` 作为关键字参数，其余作为位置参数；没有 shell 风格引号解析。`/cmd@BotName` 只响应本 Bot，命令和 Bot 名匹配不区分大小写。`ctx.args`、`ctx.kwargs` 提供参数副本。按钮先匹配最长字面前缀，否则按注册顺序尝试正则并传入捕获组。
+
+`Context` 提供用户/会话/消息门面，以及 `reply_text`、`send_text`、`reply_photo`、`send_photo`、`reply_document`、`send_document`、`edit_photo`、`edit_document`、`answer_query`。底层 Telegram 调用异常统一包装为 `BotError`。需高级 SDK 功能时可访问 `ctx.bot`、`ctx.update`；`user`、`chat`、`message`、`query` 可能为 `None`。
+
+### 配置目录与旧数据迁移
+
+`plugin_config()` 根据顶层插件名生成配置：`plugins.hello`、`plugins.hello.hello` 和 `plugins.hello.tools.client` 都默认使用 [config/hello/config.json](config/hello/config.json)。配置递归补齐默认值、保留额外字段，并按默认类型转换。返回的字典、列表都是独立副本：修改配置应使用 `set()` / `update()`，而不是直接修改 `cfg.get()` 的返回值。写入使用临时文件替换；`reload()` 重新读盘并补写缺失字段，`reset()` 恢复默认值。
+
+插件内可获取专属配置目录，用于保存缓存、数据库等文件：
+
+```python
+from core import get_plugin_config_dir, plugin_config
+
+cfg = plugin_config({"timeout": 20})
+directory = get_plugin_config_dir()  # 按顶层插件包名推导，返回绝对 Path 并创建目录
+assert cfg.directory == directory
+assert cfg.path == directory / "config.json"
+cache_path = directory / "cache.json"
+```
+
+也可以显式调用 `get_plugin_config_dir("e5", create=False)`，只取路径、不创建目录或配置文件。目录位置不依赖进程工作目录。
+
+升级时先停止旧进程。下次启动或执行 `python main.py --init-config`，会在读取配置前将旧的 [config/e5.json](config/e5.json)、[config/wm.json](config/wm.json)、[config/yiff.json](config/yiff.json) 移入各自目录，并统一命名为 config.json；E5 SQLite 与 WM 会话在对应服务初始化前迁入插件目录，数据文件名保持不变。旧默认数据路径会自动更新，显式自定义路径保持原有语义。
+
+迁移可重复执行；新旧文件同时存在时会报错并保留两边，不覆盖已有文件。旧配置格式错误时也会保留原文件。主配置 [config.json](config.json) 不迁移。目录结构、字段和存储说明见 [配置说明](config/README.md)。
+
+### 生命周期与 HTTP 回调
+
+资源生命周期使用 `@startup` / `@shutdown`，支持无参数或一个 Application 参数的异步函数。每个插件自行负责客户端、后台任务与缓存：启动钩子创建资源，停止钩子取消并等待任务、关闭连接。框架不再专门管理某个业务插件的 HTTP 客户端；例如图站启动先创建 HTTP 客户端再启动帖子池，停止先停池再关客户端。
+
+同类钩子按注册顺序执行，单个钩子异常会记录日志并继续执行其他钩子。重载和卸载使用严格停止模式：任何停止钩子失败，都会保留旧模块和注册表，中止后续卸载。此时部分资源可能已经停止，需排查日志后重试或重启，并不等同于恢复完整旧状态。
+
+插件 HTTP 回调用 `@webhook_route("/your/callback")` 注册 GET 路由，仅 webhook 模式提供服务；回调接收 aiohttp Request，需要原始 Bot 时使用 `request.app[WEBHOOK_BOT_KEY]`，其中 `WEBHOOK_BOT_KEY` 从 `core` 导入。
+
+### 热重载的边界
+
+管理员执行 `/reload` 时，按以下顺序切换全部插件，而不是只重新执行处理器文件：
+
+1. 暂停新的插件调用，等待正在执行的命令、按钮和 HTTP 回调结束；触发重载的当前任务不等待自己。
+2. 执行旧插件的 `@shutdown`，关闭客户端、WebSocket 和后台任务。
+3. 清空命令、按钮、生命周期、HTTP 回调与插件配置缓存，从 `sys.modules` 移除 `plugins` 及所有已导入的子模块，并清理对应插件字节码缓存。
+4. 重新扫描顶层入口，导入插件及其私有工具，执行 `setup()`；若此前已启动，再执行新插件的 `@startup`，使用同一个 Application 重建资源。
+
+重载期间被分发的新命令或按钮会提示稍后重试；插件 HTTP 回调返回 `503` 和 `Retry-After: 1`。Telegram 更新入口仍可入队。已有长请求会延迟重载，已排队的旧处理器不会在切换后继续执行。
+
+`reload_all_plugins()` 与 `unload_all_plugins()` 都是异步接口，调用时需 `await`；仅导入配置、尚未启动的实例执行重载不会启动网络资源。重载不重新加载 `core`、共享 `utils` 或第三方依赖。导入失败会记录日志并跳过，启动钩子失败会记录日志，整体没有事务性回滚。
+
+| 修改内容 | 生效方式 |
+| --- | --- |
+| 单文件插件、包内处理器和工具、插件配置 | `/reload`，包内模块和资源一起重建 |
+| 主配置、core / utils 代码、第三方依赖 | 重启 |
+| 已存在 HTTP 路由的处理函数 | `/reload`；新增或更改监听路径需要重启 |
+| 图站 `site`、`pool.*`、后台补池标签、UA / browser | `/reload`，重新创建 HTTP 客户端、帖子池与搜索缓存 |
+| WM 客户端配置、启动自动登录、预热开关 | `/reload`，重新执行启动逻辑，名称索引与缓存重新构建 |
+| E5 定时器启停、间隔等配置 | `/reload`，重新创建调度器并从头等待下一轮周期 |
+
+WM 会话文件、E5 SQLite 数据库和待完成 OAuth 绑定保存在插件配置目录或显式自定义路径，不随包卸载删除。WM 状态连接会关闭，需重新设置在线状态；图站换图记录、WM 候选选择与改价计划等内存状态会清空，旧按钮需重新发起命令。需要长期保留的数据应落盘，不应依赖旧模块单例。
+
+## 验证与维护
+
+安装运行依赖后即可使用标准库 `unittest`，不需要另装测试框架：
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q core utils plugins tests main.py
+```
+
+测试覆盖主配置兼容、插件配置隔离、命令与按钮分发、文件句柄关闭、生命周期清理、webhook 请求与路由、E5 OAuth/SQLite，以及全部插件的初始化和热重载。插件加载测试在临时项目副本中运行并禁止网络连接；HTTP 测试仅启动本机临时监听。测试不需要真实 Bot Token、WM 账号或 Microsoft 凭据，不代表外部服务联调已经通过。
+
+本地配置、WM 会话和 E5 SQLite 文件已加入 [.gitignore](.gitignore)，但忽略规则不等于加密。WM 会话包含 JWT，E5 数据库包含应用密钥和 refresh token；POSIX 权限设置为尽力而为，部署时应自行限制访问和保护备份。
+
+许可证：[MIT](LICENSE)。

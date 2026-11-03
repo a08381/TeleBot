@@ -30,7 +30,7 @@ MyTgBot/1.0"反而更可疑（CF 会拿 UA 与 TLS 指纹交叉验证）。所�
 - 站点没拦你、只是偶发拦截 -> 关掉 impersonate，保留合规 UA（sync_ua 就无所谓了）
 - CF 已经把你挡在门外      -> 开 impersonate，牺牲站点的 UA 合规换通过率
 
-配置示例（config/yiff.json 的 browser 段）::
+配置示例（config/yiff/config.json 的 browser 段）::
 
     "browser": {
       "impersonate": "chrome124",          // 留空 = 不启用指纹（退回 httpx）

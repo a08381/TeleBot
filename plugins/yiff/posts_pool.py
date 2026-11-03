@@ -1,11 +1,7 @@
-"""帖子预热池：后台提前把图拉好，指令来了直接取，用户侧零网络往返。
+"""图站插件的帖子元数据预热池与搜索缓存。
 
-这是一个**通用组件**，本身不含任何站点信息：
-站点地址、标签、限流、池容量都由使用方（插件）通过 PoolSettings 注入，
-依赖的带指纹 HTTP 客户端由 utils.http_pool 提供。
-
-以 yiff 插件为例：参数写在 config/yiff.json，插件在自己的 startup 钩子里
-调用 pool_start(PoolSettings.from_mapping(...)) 启动本池。
+配置由 PoolSettings 注入，HTTP 客户端来自同包的 http_pool。
+插件停止时先取消并等待补池任务，再关闭 HTTP 客户端；重载后新建池。
 """
 
 from __future__ import annotations
@@ -188,6 +184,7 @@ class PostPool:
     async def start(self) -> None:
         if self._task is not None:
             return
+        self._closed = False
         await self._refill_once()
         self._stop = asyncio.Event()
         self._task = asyncio.create_task(self._loop())
@@ -211,7 +208,7 @@ class PostPool:
 
 
 # ---------------------------------------------------------------- 单例
-# 池必须挂在模块级：plugins.* 会被 reload 清掉，实例放插件里热重载一次就没了
+# 图池随插件包重建，不跨重载保留实例。
 _pool: Optional[PostPool] = None
 _started = False
 
@@ -246,7 +243,8 @@ async def pool_start(cfg: PoolSettings, *, restart: bool = False) -> PostPool:
 
 
 async def pool_stop() -> None:
-    global _started
+    global _pool, _started
     if _pool is not None:
         await _pool.stop()
+    _pool = None
     _started = False

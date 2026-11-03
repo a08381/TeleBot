@@ -1,14 +1,14 @@
-"""plugins/wm.py —— Warframe Market 托管：登录 / 改在线状态 / 查价（支持黑话）。
+"""Warframe Market 托管：登录 / 改在线状态 / 查价（支持黑话）。
 
 **一个 Telegram user id 绑定一个 WM 账号**：A 改状态不会动到 B 的账号，
-会话按 user id 分开存在 config/wm_sessions.json（权限 0600）。
+会话按 user id 分开存在 config/wm/wm_sessions.json（权限 0600）。
 
 指令
 ----
     /wm                     面板：自己绑定的账号 + 状态按钮
     /wm online|ingame|invisible|offline 直接改**自己**账号的状态
     /wmstatus [状态]        查看 / 改自己账号的状态
-    /wmlogin [邮箱 密码]     绑定（不带参数 = 主人用 config/wm.json 里的账号）
+    /wmlogin [邮箱 密码]     绑定（不带参数 = 主人用 config/wm/config.json 里的账号）
     /wmlogout [tg用户id]     解绑（不带参数 = 解绑自己；带 id 需主人权限）
     /wmwho                  查看已绑定了哪些账号（主人）
     /wmitems [页码]          分页查看自己的卖单和参考价
@@ -40,8 +40,9 @@ import uuid
 from typing import Optional
 
 from core import Context, Keyboard, button, get_config, listener, plugin_config, shutdown, startup
-from utils import wm_api
-from utils.wm_api import (
+from utils.plugin_migration import migrate_default_data
+from . import wm_api
+from .wm_api import (
     DEFAULT_UA,
     RANK_MAX,
     SETTABLE_STATUSES,
@@ -56,14 +57,13 @@ from utils.wm_api import (
     wm_start,
     wm_stop,
 )
-from utils.wm_items import Item, ItemIndex, get_index, parse_query
+from .wm_items import Item, ItemIndex, get_index, parse_query
 
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ 配置
-# 首次运行自动生成 config/wm.json。
-# 注意：这里**不复用** utils.http_pool（那是 yiff 用的单站点单例），
-# wm 走 utils.wm_api 自己的客户端 —— 站点、UA、JWT 都不一样。
+# 首次运行自动生成 config/wm/config.json。
+# WM 使用本包的客户端，不与图站共享站点、UA 或账号连接。
 cfg = plugin_config({
     "_comment": "Warframe Market 插件配置；一个 Telegram user id 绑定一个 WM 账号",
 
@@ -111,7 +111,7 @@ cfg = plugin_config({
     },
     "rate_limit": {"rps": 3.0, "burst": 3.0},   # 官方公共限流 3 RPS
     "cache": {"items_ttl": 86400.0, "orders_ttl": 60.0},
-    "session_file": "config/wm_sessions.json",  # 会话库：tg id -> 账号（含 JWT，权限 0600）
+    "session_file": "config/wm/wm_sessions.json",  # 会话库：tg id -> 账号（含 JWT，权限 0600）
     "warm_items": True,          # 启动时预热物品清单（查黑话要用）
 
     # ---- 查价 ----
@@ -223,15 +223,14 @@ cfg = plugin_config({
 })
 
 
-def _migrate_session_file() -> None:
-    """老配置的 session_file 指向单账号文件；名字改成会话库，语义才对得上。
+def _migrate_session_file() -> str:
+    """先搬多账户会话库；旧单账户文件原名归档，不猜测 Telegram 所有者。"""
+    return migrate_default_data(
+        cfg, "session_file", "wm_sessions.json", legacy_filenames=("wm_session.json",)
+    )
 
-    值已经被人手改过就尊重它，只动那个旧默认值。
-    """
-    raw = str(cfg.get("session_file") or "").strip()
-    if raw == "config/wm_session.json":
-        cfg.set("session_file", "config/wm_sessions.json")
-        logger.info("会话存储已切换到多账号格式：config/wm_sessions.json（旧会话需重新 /wmlogin）")
+
+_SESSION_FILE = _migrate_session_file()
 
 
 def _client_settings() -> dict:
@@ -241,7 +240,7 @@ def _client_settings() -> dict:
         "language": cfg.get("language") or "en",
         "crossplay": bool(cfg.get("crossplay")),
         "browser": cfg.get("browser"),
-        "session_file": cfg.get("session_file") or "config/wm_sessions.json",
+        "session_file": _SESSION_FILE,
         "api": cfg.get("api"),
         "rate_limit": cfg.get("rate_limit"),
         "cache": cfg.get("cache"),
@@ -249,7 +248,6 @@ def _client_settings() -> dict:
 
 
 # 同 yiff.configure_site()：模块 import 时就登记参数，早于任何请求。
-_migrate_session_file()
 configure(_client_settings())
 
 # 候选物品的短 key（callback_data 有 64 字节上限，slug 可能超）
@@ -377,7 +375,7 @@ async def wm_panel(ctx: Context, *args, **kwargs):
     else:
         lines.append("还没绑定账号 —— 发 /wmlogin 邮箱 密码 绑定你自己的 WM 账号")
         if _owner_only(ctx):
-            lines.append("（主人也可以把账号填进 config/wm.json 的 account 段再 /wmlogin）")
+            lines.append("（主人也可以把账号填进 config/wm/config.json 的 account 段再 /wmlogin）")
 
     try:
         index = await _ensure_items()
@@ -399,7 +397,7 @@ async def wm_panel(ctx: Context, *args, **kwargs):
 async def wm_login(ctx: Context, *args, **kwargs):
     """绑定 WM 账号到**当前** Telegram 用户。"""
     if not _can_bind(ctx):
-        await ctx.reply_text("当前不允许普通用户绑定 WM 账号（config/wm.json 的 bind.allow_all）")
+        await ctx.reply_text("当前不允许普通用户绑定 WM 账号（config/wm/config.json 的 bind.allow_all）")
         return
 
     # 密码出现在聊天记录里不好，能删就删
@@ -418,7 +416,7 @@ async def wm_login(ctx: Context, *args, **kwargs):
         if not _owner_only(ctx):
             await ctx.reply_text(
                 "用法：/wmlogin 邮箱 密码\n"
-                "（不带参数时用的是主人在 config/wm.json 里预设的账号，只有主人能用）"
+                "（不带参数时用的是主人在 config/wm/config.json 里预设的账号，只有主人能用）"
             )
             return
         account = cfg.get("account") or {}
@@ -427,7 +425,7 @@ async def wm_login(ctx: Context, *args, **kwargs):
         if not email or not password:
             await ctx.reply_text(
                 "用法：/wmlogin 邮箱 密码\n"
-                "或把邮箱密码填进 config/wm.json 的 account 段再 /wmlogin（不进聊天记录）"
+                "或把邮箱密码填进 config/wm/config.json 的 account 段再 /wmlogin（不进聊天记录）"
             )
             return
         target = _owner_account_user_id()
@@ -467,7 +465,7 @@ async def wm_logout(ctx: Context, *args, **kwargs):
             await ctx.reply_text("只有主人可以解绑别人的账号")
             return
         if not (cfg.get("bind") or {}).get("owner_can_unbind_all", True):
-            await ctx.reply_text("主人解绑他人已关闭（config/wm.json 的 bind.owner_can_unbind_all）")
+            await ctx.reply_text("主人解绑他人已关闭（config/wm/config.json 的 bind.owner_can_unbind_all）")
             return
         try:
             target = int(str(args[0]).strip())
@@ -1330,7 +1328,7 @@ async def wm_price(ctx: Context, *args, **kwargs):
             await ctx.reply_text(
                 f"没找到「{text}」对应的物品。\n"
                 "· 换个官方名试试（英文更稳，如 arcane energize）\n"
-                "· 也可以把常用叫法加进 config/wm.json 的 aliases 段"
+                "· 也可以把常用叫法加进 config/wm/config.json 的 aliases 段"
             )
         return
 

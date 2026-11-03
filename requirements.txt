@@ -8,8 +8,8 @@ httpx>=0.27,<1.0
 # WebSocket 状态连接
 websockets>=15.0,<16.0
 
-# 浏览器指纹（TLS/JA3 + HTTP/2）：过 Cloudflare 靠它，装上才能用
-# browser.impersonate；没装会自动退回 httpx（功能不受影响，只是没有指纹）
+# 浏览器指纹（TLS/JA3 + HTTP/2），供 browser.impersonate 使用
+# 未安装时可回退 httpx；回退不保证目标站点仍接受请求
 curl_cffi>=0.9,<1.0
 
 # 可选：需要 HTTP/2 时
