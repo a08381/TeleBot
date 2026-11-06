@@ -11,8 +11,9 @@
     /wmlogin [邮箱 密码]     绑定（不带参数 = 主人用 config/wm/config.json 里的账号）
     /wmlogout [tg用户id]     解绑（不带参数 = 解绑自己；带 id 需主人权限）
     /wmwho                  查看已绑定了哪些账号（主人）
-    /wmitems [页码]          分页查看自己的卖单和参考价
-    /wmreprice              预览后批量匹配最低竞争卖价
+    /wmitems [页码]          图片卡片与商品目录，快捷改价 / 售出
+    /wmbump                 一键按当前原价重新提交全部卖单
+    /wmreprice [keep]       预览批量匹配最低价；keep 直接原价重提
     /price <物品> [platform=ps4] [crossplay=true] [rank=5]   查价（公开数据，无需登录）
     /wmrefresh              强制刷新物品清单（主人）
     /wmdiag                 逐个试探端点，看官方接口现在长什么样（主人）
@@ -58,6 +59,7 @@ from .wm_api import (
     wm_stop,
 )
 from .wm_items import Item, ItemIndex, get_index, parse_query
+from .listings import CB_LISTING, Listings, market_sell_prices as _market_sell_prices
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +125,7 @@ cfg = plugin_config({
         "send_thumb": True,     # 尝试带物品图标，失败自动退回纯文本
     },
     "my_listings": {
-        "page_size": 8,         # /wmitems 每页挂单数
+        "page_size": 8,         # /wmitems 每页商品按钮数，点击切换图片卡片
     },
 
     # ---- 黑话 ----
@@ -259,9 +261,8 @@ CB_LOGOUT = "wm:logout"
 CB_PICK = "wm:pick:"
 CB_MY_ORDERS = "wm:mine:"
 CB_REPRICE = "wm:reprice:"
-CB_REPRICE_ONE = "wm:one:"
 CB_SHOW_ALL_ORDERS = "wm:showall"
-MY_ORDER_PAGE_SIZE = 8
+CB_BUMP = "wm:bump"
 
 
 # ------------------------------------------------------------------ 工具
@@ -343,6 +344,8 @@ def _panel_keyboard() -> Keyboard:
         .callback("⚪️ 离线", f"{CB_STATUS}offline")
         .row()
         .callback("📦 我的挂单", f"{CB_MY_ORDERS}0")
+        .callback("♻️ 全部卖单原价重提", CB_BUMP)
+        .row()
         .callback("👁 全部订单设为可见", CB_SHOW_ALL_ORDERS)
         .row()
         .callback("📊 我的状态", CB_ME)
@@ -386,7 +389,7 @@ async def wm_panel(ctx: Context, *args, **kwargs):
     lines.append("")
     lines.append("查价：/price 满级充沛 · /price 咖喱p 图纸")
     if session.logged_in:
-        lines.append("挂单：/wmitems · 批量改价：/wmreprice（匹配最低竞争卖价）")
+        lines.append("挂单：/wmitems · 原价重提：/wmbump · 批量最低价：/wmreprice")
     lines.append(    "状态：/wmstatus ingame · /wm offline 可断开连接")
 
     await ctx.reply_text("\n".join(lines), reply_markup=_panel_keyboard())
@@ -588,180 +591,22 @@ async def wm_status(ctx: Context, *args, **kwargs):
 
 
 # ------------------------------------------------------------------ 查价
-def _rank_matches(order: dict, rank: int) -> bool:
-    try:
-        return int(order.get("rank") or 0) == rank
-    except (TypeError, ValueError):
-        return False
-
-
-def _market_sell_prices(orders: list[dict], *, rank: int, own_order_ids: set[str],
-                        only_online: bool) -> list[int]:
-    prices = []
-    for order in orders:
-        if order.get("type") != "sell" or order.get("visible") is False:
-            continue
-        if not _rank_matches(order, rank) or str(order.get("id") or "") in own_order_ids:
-            continue
-        if only_online and order.get("user_status") not in wm_api.ONLINE_STATUSES:
-            continue
-        try:
-            price = int(order.get("platinum"))
-        except (TypeError, ValueError):
-            continue
-        if price > 0:
-            prices.append(price)
-    return sorted(prices)
+_listings = Listings(cfg, _ensure_items)
 
 
 async def _show_my_orders(ctx: Context, page: int = 0) -> None:
-    try:
-        client = await wm()
-        session = client.session_for(_tg_id(ctx))
-        if not session.logged_in:
-            await ctx.reply_text("你还没绑定 WM 账号，先 /wmlogin 邮箱 密码")
-            return
-        orders = await client.get_my_orders(session)
-    except WMError as exc:
-        await ctx.reply_text(f"❌ 获取自己的挂单失败：{exc}")
-        return
+    await _listings.show(ctx, page)
 
-    sell_orders = [order for order in orders if order.get("type") == "sell"]
-    if not sell_orders:
-        hidden_count = sum(1 for order in orders if order.get("visible") is False)
-        keyboard = Keyboard().callback("👁 全部订单设为可见", CB_SHOW_ALL_ORDERS)
-        await ctx.reply_text(
-            f"当前账号没有卖单，共 {len(orders)} 个订单，其中隐藏 {hidden_count} 个。",
-            reply_markup=keyboard,
-        )
-        return
 
-    try:
-        index = await _ensure_items()
-    except WMError as exc:
-        await ctx.reply_text(f"❌ 读取物品清单失败，暂时无法匹配挂单名称：{exc}")
-        return
+@button(CB_LISTING)
+async def on_listing_button(ctx: Context, payload: str):
+    await _listings.handle(ctx, payload)
 
-    listing_cfg = cfg.get("my_listings") or {}
-    page_size = max(1, min(20, int(listing_cfg.get("page_size") or MY_ORDER_PAGE_SIZE)))
-    max_page = (len(sell_orders) - 1) // page_size
-    page = max(0, min(page, max_page))
-    start = page * page_size
-    shown = sell_orders[start:start + page_size]
-    own_ids = {str(order.get("id") or "") for order in sell_orders if order.get("id")}
-    price_cfg = cfg.get("price") or {}
-    only_online = bool(price_cfg.get("only_online", True))
-    platform = session.platform or client.platform
 
-    listing_keys = set()
-    for order in shown:
-        item = index.get_by_id(str(order.get("item_id") or ""))
-        if not item:
-            continue
-        try:
-            rank = int(order.get("rank") or 0)
-        except (TypeError, ValueError):
-            rank = 0
-        listing_keys.add((item.slug, rank if item.has_rank else None))
-
-    async def market_data(slug: str, rank: Optional[int]) -> tuple[list[dict], dict, list[str]]:
-        errors: list[str] = []
-        market_orders: list[dict] = []
-        statistics: dict = {}
-        try:
-            market_orders = await client.get_orders(
-                slug, platform=platform, crossplay=client.crossplay
-            )
-        except WMError as exc:
-            errors.append(f"市场挂单：{exc}")
-        try:
-            statistics = await client.get_statistics(slug, rank=rank)
-        except WMError as exc:
-            errors.append(f"成交统计：{exc}")
-        return market_orders, statistics, errors
-
-    snapshots = {}
-    for key in listing_keys:
-        snapshots[key] = await market_data(key[0], key[1])
-
-    lines = [
-        f"📦 {session.label} 的卖单（第 {page + 1}/{max_page + 1} 页，共 {len(sell_orders)} 条）",
-        f"全部订单：{len(orders)} 个 · 隐藏：{sum(1 for order in orders if order.get('visible') is False)} 个",
-        f"市场参考：{platform} · {'仅在线/游戏中' if only_online else '包含离线挂单'}",
-        "",
-    ]
-    keyboard = Keyboard().callback("👁 全部订单设为可见", CB_SHOW_ALL_ORDERS).row()
-    for order in shown:
-        item = index.get_by_id(str(order.get("item_id") or ""))
-        item_name = item.display if item else str(order.get("item_id") or "未知物品")
-        try:
-            original_price = int(order.get("platinum") or 0)
-        except (TypeError, ValueError):
-            original_price = 0
-        try:
-            rank = int(order.get("rank") or 0)
-        except (TypeError, ValueError):
-            rank = 0
-        title = item_name + (f" · r{rank}" if item and item.has_rank else "")
-        lines.append(f"• {title}")
-        lines.append(f"  原价（当前挂单价）：{original_price}p · 数量：{order.get('quantity', 1)}")
-        if not item:
-            lines.append("  市场价：物品 ID 未匹配，刷新物品清单后重试")
-            continue
-
-        key = (item.slug, rank if item.has_rank else None)
-        market_orders, statistics, errors = snapshots[key]
-        prices = _market_sell_prices(
-            market_orders,
-            rank=rank,
-            own_order_ids=own_ids,
-            only_online=only_online,
-        )
-        lowest = f"{prices[0]}p" if prices else "-"
-        second = f"{prices[1]}p" if len(prices) > 1 else "-"
-        lines.append(f"  市场最低：{lowest} · 次低：{second}")
-        latest = (statistics.get("48hours") or {})
-        latest_price = latest.get("median")
-        latest_time = latest.get("datetime") or ""
-        if latest_price is not None:
-            lines.append(f"  最近成交统计：近48h最新小时中位 {_fmt_money(float(latest_price))}p"
-                         + (f"（{latest_time}）" if latest_time else ""))
-        else:
-            lines.append("  最近成交统计：-")
-        for error in errors:
-            lines.append(f"  ⚠️ {error}")
-        lines.append("")
-        order_id = str(order.get("id") or "")
-        if order_id and order.get("visible") is not False and prices and prices[0] != original_price:
-            key = uuid.uuid4().hex[:10]
-            _SINGLE_REPRICE_PLANS[key] = (
-                _tg_id(ctx),
-                time.monotonic(),
-                {
-                    "id": order_id,
-                    "slug": item.slug,
-                    "item": item.display,
-                    "rank": rank,
-                    "current": original_price,
-                    "target": prices[0],
-                },
-            )
-            keyboard.callback("↘️ 匹配最低价", f"{CB_REPRICE_ONE}{key}").row()
-
-    if page > 0 or page < max_page:
-        if keyboard:
-            keyboard.row()
-        if page > 0:
-            keyboard.callback("⬅️ 上一页", f"{CB_MY_ORDERS}{page - 1}")
-        if page < max_page:
-            keyboard.callback("下一页 ➡️", f"{CB_MY_ORDERS}{page + 1}")
-
-    now = time.monotonic()
-    for old_key, (_, created, _) in list(_SINGLE_REPRICE_PLANS.items()):
-        if now - created > 600:
-            _SINGLE_REPRICE_PLANS.pop(old_key, None)
-
-    await ctx.reply_text("\n".join(lines).rstrip(), reply_markup=keyboard if keyboard else None)
+@listener("wmbump")
+async def wm_bump(ctx: Context, *args, **kwargs):
+    """一键按当前价格重新提交全部卖单，包含隐藏卖单且保留可见状态。"""
+    await _listings.bump(ctx)
 
 
 @listener("wmitems")
@@ -832,6 +677,12 @@ def _reprice_keyboard(key: str) -> Keyboard:
 
 @listener("wmreprice")
 async def wm_reprice(ctx: Context, *args, **kwargs):
+    if args and str(args[0]).lower() in ("keep", "original", "原价"):
+        await _listings.bump(ctx)
+        return
+    if args:
+        await ctx.reply_text("用法：/wmreprice 预览最低价改价；/wmreprice keep 或 /wmbump 原价重提")
+        return
     try:
         client = await wm()
         session = client.session_for(_tg_id(ctx))
@@ -950,7 +801,6 @@ async def wm_reprice(ctx: Context, *args, **kwargs):
 
 
 _BULK_REPRICE_PLANS: dict[str, tuple[int, float, list[dict]]] = {}
-_SINGLE_REPRICE_PLANS: dict[str, tuple[int, float, dict]] = {}
 
 
 @button(CB_MY_ORDERS)
@@ -964,73 +814,16 @@ async def on_my_orders_button(ctx: Context, page: str):
     await _show_my_orders(ctx, page_number)
 
 
+@button(CB_BUMP)
+async def on_bump_button(ctx: Context, _payload: str = ""):
+    await ctx.answer_query()
+    await _listings.bump(ctx)
+
+
 @button(CB_SHOW_ALL_ORDERS)
 async def on_show_all_orders_button(ctx: Context, _payload: str = ""):
     await ctx.answer_query()
     await _show_all_orders(ctx)
-
-
-@button(CB_REPRICE_ONE)
-async def on_reprice_one_button(ctx: Context, key: str):
-    await ctx.answer_query()
-    plan_data = _SINGLE_REPRICE_PLANS.get(key)
-    if not plan_data:
-        await ctx.answer_query("此按钮已过期，请重新打开 /wmitems", show_alert=True)
-        return
-    owner_id, created, entry = plan_data
-    if owner_id != _tg_id(ctx):
-        await ctx.answer_query("此改价按钮不属于你的账号", show_alert=True)
-        return
-    _SINGLE_REPRICE_PLANS.pop(key, None)
-    if time.monotonic() - created > 600:
-        await ctx.answer_query("此按钮已过期，请重新打开 /wmitems", show_alert=True)
-        return
-
-    try:
-        client = await wm()
-        session = client.session_for(_tg_id(ctx))
-        if not session.logged_in:
-            await ctx.reply_text("登录已失效，请先重新 /wmlogin")
-            return
-        current_orders = await client.get_my_orders(session)
-        current = next(
-            (order for order in current_orders if str(order.get("id") or "") == entry["id"]),
-            None,
-        )
-        if not current or current.get("type") != "sell" or current.get("visible") is False:
-            await ctx.reply_text(f"⏭️ {entry['item']}：挂单已删除或隐藏，请重新打开 /wmitems")
-            return
-        if int(current.get("platinum") or 0) != entry["current"]:
-            await ctx.reply_text(f"⏭️ {entry['item']}：原价已变化，请重新打开 /wmitems")
-            return
-
-        fresh_orders = await client.get_orders(
-            entry["slug"],
-            platform=session.platform or client.platform,
-            crossplay=client.crossplay,
-            force=True,
-        )
-        price_cfg = cfg.get("price") or {}
-        prices = _market_sell_prices(
-            fresh_orders,
-            rank=entry["rank"],
-            own_order_ids={
-                str(order.get("id") or "")
-                for order in current_orders
-                if order.get("id")
-            },
-            only_online=bool(price_cfg.get("only_online", True)),
-        )
-        if not prices or prices[0] != entry["target"]:
-            await ctx.reply_text(f"⏭️ {entry['item']}：市场最低价已变化，请重新打开 /wmitems 后再改")
-            return
-        updated = await client.update_order_price(entry["id"], entry["target"], session)
-    except WMError as exc:
-        await ctx.reply_text(f"❌ {entry['item']} 改价失败：{exc}")
-        return
-    await ctx.reply_text(
-        f"✅ {entry['item']} 已从 {entry['current']}p 改为 {updated['platinum']}p"
-    )
 
 
 @button(CB_REPRICE)

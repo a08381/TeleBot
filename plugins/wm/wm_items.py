@@ -291,9 +291,16 @@ class ItemIndex:
             tags = raw.get("tags")
             i18n = raw.get("i18n")
             english_i18n = i18n.get("en") if isinstance(i18n, Mapping) else {}
-            thumb = raw.get("thumb") or (
-                english_i18n.get("thumb") if isinstance(english_i18n, Mapping) else ""
+            thumb = raw.get("thumb") or raw.get("icon") or (
+                (english_i18n.get("thumb") or english_i18n.get("icon"))
+                if isinstance(english_i18n, Mapping) else ""
             )
+            if not thumb and isinstance(i18n, Mapping):
+                thumb = next((
+                    value.get("thumb") or value.get("icon")
+                    for value in i18n.values()
+                    if isinstance(value, Mapping) and (value.get("thumb") or value.get("icon"))
+                ), "")
             item = Item(
                 slug=slug,
                 name_en=name_en or slug.replace("_", " ").title(),

@@ -21,18 +21,20 @@ WM 与图站使用各自的私有客户端：站点、身份和生命周期相�
 公开数据（物品清单、订单、统计）不需要账号，全局共享缓存，符合官方
 "必须缓存响应"的要求。
 
-API 现状（2026-09，合同版本仍 < 1.0，随时可能变）
+API 现状（2026-11，官方文档版本 v0.25.0，随时可能变）
 ------------------------------------------------
 官方文档明确：v1 已弃用，但 OAuth 2.0 尚未开放，**需要用户授权的集成仍然要
-走 v1 授权流程**。所以这里是「v1 拿凭证 + v2 读数据 + WebSocket 写状态」：
+走 v1 授权流程**。所以这里是「v1 拿凭证 + v2 订单读写 + WebSocket 写状态」：
 
     登录        POST  /v1/auth/signin      （社区强一致；官方说 v1 仍用于授权）
     当前用户    GET   /v2/me               （官方已文档化）
     我的挂单    GET   /v2/orders/my        （需登录）
     改挂单价    PATCH /v2/order/{id}       （需登录）
+    登记售出    POST  /v2/order/{id}/close （数量须整除 perTrade，返回成交回执）
+    最近售出价  会话文件旁 wm_sales.json   （仅本插件记录，不代表全部账号历史）
     订单        GET   /v2/orders/item/{slug}   （官方已文档化，公开无需登录）
     物品清单    GET   /v1/items            （回退 /v2/items）
-    历史统计    GET   /v1/items/{slug}/statistics （社区一致，可选功能）
+    聚合统计    GET   /v1/items/{slug}/statistics （社区一致，不是账号逐笔成交）
     状态写入    WebSocket /socket-v2（认证后发状态事件；offline 时断开连接）
 
 官方 Rules 要求：全局 **3 RPS**、User-Agent 必须可识别、必须缓存响应 ——
@@ -44,10 +46,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional
 from urllib.parse import quote
@@ -374,10 +378,17 @@ def normalize_order(raw: Mapping[str, Any]) -> dict:
         platinum = int(raw.get("platinum") or 0)
     except (TypeError, ValueError):
         platinum = 0
-    try:
-        quantity = int(raw.get("quantity") or 1)
-    except (TypeError, ValueError):
-        quantity = 1
+    def count(value: Any) -> int:
+        # 写操作会使用这些数值；缺失、布尔或小数均不伪装成有效库存。
+        if type(value) not in (int, str):
+            return 0
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+
+    quantity = count(raw.get("quantity"))
+    per_trade = count(raw.get("perTrade", raw.get("per_trade", 1)))
 
     return {
         "id": str(raw.get("id") or ""),
@@ -385,12 +396,93 @@ def normalize_order(raw: Mapping[str, Any]) -> dict:
         "type": order_type,
         "platinum": platinum,
         "quantity": quantity,
+        "per_trade": per_trade,
         "rank": rank,
         "visible": bool(raw.get("visible", True)),
         "user": str(user.get("ingameName") or user.get("ingame_name") or ""),
         "user_status": str(user.get("status") or ""),
         "platform": str(raw.get("platform") or ""),
     }
+
+
+def _sale_datetime(value: Any) -> Optional[datetime]:
+    """成交先后按带时区的创建时间比较，不用修改时间或字符串顺序猜测。"""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return None
+    return parsed if parsed.utcoffset() is not None else None
+
+
+def _sale_platinum(value: Any) -> bool:
+    """保留回执中的数值精度，不将小数价格截断，也不接受布尔或非有限值。"""
+    return (type(value) is int and value > 0) or (
+        type(value) is float and math.isfinite(value) and value > 0
+    )
+
+
+class _SaleStore:
+    """仅保存本插件拿到的逐笔回执；每个 WM 账号、物品、等级保留最新一笔。"""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.sales: dict[tuple[str, str, int], dict] = {}
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                return
+            records = payload.get("sales")
+            if not isinstance(records, list):
+                return
+            for record in records:
+                if self._valid(record):
+                    self._keep_latest(dict(record))
+        except (OSError, ValueError) as exc:
+            logger.warning("读取 WM 本地成交记录失败（忽略）: %s", exc)
+
+    @staticmethod
+    def _valid(record: Any) -> bool:
+        if not isinstance(record, dict):
+            return False
+        return (
+            all(isinstance(record.get(key), str) and record[key]
+                for key in ("wm_user_id", "item_id", "transaction_id", "order_id"))
+            and type(record.get("rank")) is int and record["rank"] >= 0
+            and type(record.get("quantity")) is int and record["quantity"] > 0
+            and _sale_platinum(record.get("platinum"))
+            and _sale_datetime(record.get("datetime")) is not None
+            and record.get("source") == "local"
+        )
+
+    def _keep_latest(self, record: dict) -> None:
+        key = (record["wm_user_id"], record["item_id"], record["rank"])
+        previous = self.sales.get(key)
+        if previous is None or _sale_datetime(record["datetime"]) > _sale_datetime(previous["datetime"]):
+            self.sales[key] = record
+
+    def remember(self, record: dict) -> None:
+        if not self._valid(record):
+            return
+        self._keep_latest(dict(record))
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(
+                json.dumps({"version": 1, "sales": list(self.sales.values())}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self.path)
+        except OSError as exc:
+            # 已完成的售出不因本地磁盘失败而变成失败，避免调用方误重试。
+            logger.warning("WM 售出已成功，但本地成交记录保存失败: %s", exc)
+
+    def latest(self, account_id: str, item_id: str, rank: int) -> Optional[dict]:
+        record = self.sales.get((account_id, item_id, rank))
+        return dict(record) if record is not None else None
 
 
 def thumb_url(thumb: str) -> str:
@@ -435,6 +527,7 @@ class WMClient:
         self.timeout = float(timeout or 20.0)
         self.browser = browser if isinstance(browser, BrowserProfile) else BrowserProfile.from_mapping(browser or {})
         self.store = SessionStore(session_path)
+        self._sales = _SaleStore(self.store.path.with_name("wm_sales.json"))
         self.v1_base = (v1_base or V1_BASE).rstrip("/")
         self.v2_base = (v2_base or V2_BASE).rstrip("/")
         # auto：v1 用 JWT（历史写法），v2 用 Bearer（官方 v2 写法）
@@ -449,6 +542,7 @@ class WMClient:
         self._orders_cache: dict[str, tuple[float, list[dict]]] = {}
         self._status_sockets: dict[int, Any] = {}
         self._status_lock = asyncio.Lock()
+        self._sale_lock = asyncio.Lock()
 
     # ------------------------------------------------------------ 底层
     def _base_headers(self) -> dict[str, str]:
@@ -530,6 +624,8 @@ class WMClient:
                 kind="auth",
                 status=status,
             )
+        if 300 <= status < 400:
+            raise WMError("接口返回未完成的重定向", kind="api", status=status)
         if status >= 400:
             detail = _error_of(body) or ""
             raise WMError(
@@ -549,6 +645,7 @@ class WMClient:
         session: Optional[WMSession] = None,
         auth: bool = True,
         v2: bool = True,
+        allow_empty: bool = False,
         headers: Optional[Mapping[str, str]] = None,
         **kwargs: Any,
     ) -> Any:
@@ -556,13 +653,27 @@ class WMClient:
 
         ``auth=False`` 用于公开接口（清单 / 订单 / 统计），此时不需要 session；
         ``auth=True`` 而 session 没登录则抛 auth，由插件提示去 /wmlogin。
+        ``allow_empty=True`` 仅供允许空成功响应的写接口使用；不吞掉错误或畸形 JSON。
         """
         resp = await self._request(method, url, session=session, auth=auth, headers=headers, **kwargs)
-        body = self._json(resp)
+        parsed = True
+        try:
+            body = resp.json()
+        except Exception:
+            body, parsed = None, False
         self._guard(resp, body)
         data = unwrap_v2(body) if v2 else unwrap_v1(body)
         if data is None:
-            raise WMError("响应格式不符（可能接口已变更）", kind="api", detail=str(body)[:200])
+            status = int(resp.status_code)
+            explicit_null = parsed and (
+                body is None or (isinstance(body, dict) and "data" in body and body["data"] is None)
+            )
+            if allow_empty and 200 <= status < 300 and (status == 204 or explicit_null):
+                return None
+            raise WMError(
+                "响应格式不符（可能接口已变更）", kind="api", code="response_format",
+                detail=str(body)[:200],
+            )
         return data
 
     # ------------------------------------------------------------ 会话查询
@@ -1049,6 +1160,172 @@ class WMClient:
             )
         self._orders_cache.clear()
         return normalized
+
+    async def _sale_account_id(self, session: WMSession) -> str:
+        if session is None or not session.logged_in:
+            raise WMError("该用户还没有绑定 Warframe Market 账号，先 /wmlogin", kind="auth")
+        if not session.wm_user_id:
+            await self.get_me(session)
+        if not session.wm_user_id:
+            raise WMError("账号信息缺少 WM 用户 ID，请重新绑定后再操作", kind="auth")
+        return session.wm_user_id
+
+    async def sell_order(
+        self,
+        order_id: str,
+        quantity: int | str,
+        session: WMSession,
+        *,
+        platinum: Optional[int] = None,
+    ) -> dict:
+        """按当前挂单价格登记售出；数量为正整数或 ``"all"``。
+
+        官方契约：https://docs.warframe.market/docs/api/orders#close-order
+        POST /v2/order/{id}/close 只接收 quantity，原子扣减；不通过改数量模拟成交。
+        数量须整除 perTrade，故批量订单不一定支持售出 1 件。操作前重读当前账号
+        的挂单；platinum 只做前置比对，服务端没有原子锁价参数。
+
+        返回 order_id/item_id/rank/requested_quantity 及真实回执的 quantity、
+        platinum、datetime、transaction_id、confirmed。成功但无回执（204/null）
+        时这四个成交字段为 None、confirmed=False，调用方应刷新，不自动重试。
+        有回执时价格和数量以服务端为准，可能因网页并发修改而不同于预读值。
+        紧凑回执省略物品信息时，使用本次售出前读到的同一订单上下文；回执的
+        显式等级优先。identity_source 标明身份来自回执、预读快照或两者混合，
+        快照不保证覆盖网页同时修改等级的竞态。history_recorded 表示已录入内存。
+        """
+        order_id = str(order_id or "").strip()
+        if not order_id:
+            raise WMError("缺少订单 ID", kind="config")
+        if quantity != "all" and (type(quantity) is not int or not 1 <= quantity <= 9999):
+            raise WMError("售出数量必须是 1 到 9999 的整数或 all", kind="config")
+        if platinum is not None and (type(platinum) is not int or not 1 <= platinum <= 900000):
+            raise WMError("校验价格必须是 1 到 900000 的整数", kind="config")
+        account_id = await self._sale_account_id(session)
+
+        async with self._sale_lock:
+            orders = await self.get_my_orders(session)
+            order = next((entry for entry in orders if entry["id"] == order_id), None)
+            if order is None or order["type"] != "sell":
+                raise WMError("当前账号没有这笔卖单，请刷新列表", kind="config", code="order_changed")
+            remaining = order["quantity"]
+            per_trade = order.get("per_trade", 1)
+            if (type(remaining) is not int or not 1 <= remaining <= 9999
+                    or type(per_trade) is not int or not 1 <= per_trade <= 6
+                    or remaining % per_trade or not order["item_id"]):
+                raise WMError("卖单数量或物品信息异常，请刷新后再操作", kind="api")
+            requested = remaining if quantity == "all" else quantity
+            if requested > remaining:
+                raise WMError("售出数量超过当前库存，请刷新列表", kind="config", code="order_changed")
+            if requested % per_trade:
+                raise WMError(f"该卖单每次交易 {per_trade} 件，售出数量须为其整数倍", kind="config")
+            if platinum is not None and order["platinum"] != platinum:
+                raise WMError("卖单价格已经变化，请刷新后确认", kind="config", code="order_changed")
+            result = {
+                "order_id": order_id,
+                "item_id": order["item_id"],
+                "rank": order["rank"],
+                "requested_quantity": requested,
+                "quantity": None,
+                "platinum": None,
+                "datetime": None,
+                "transaction_id": None,
+                "confirmed": False,
+                "history_recorded": False,
+                "identity_source": None,
+            }
+            try:
+                data = await self.call(
+                    "POST", f"{self.v2_base}/order/{quote(order_id, safe='')}/close",
+                    session=session, v2=True, allow_empty=True,
+                    json={"quantity": requested}, headers={"Content-Type": "application/json"},
+                )
+            except WMError as exc:
+                if exc.kind == "network" or exc.code == "response_format":
+                    raise WMError(
+                        "售出请求结果待确认，请刷新订单后再操作，勿自动重试",
+                        kind=exc.kind, code="sale_unconfirmed", detail=result,
+                    ) from exc
+                raise
+            finally:
+                # 即使响应途中断线，远端也可能已经扣减；旧挂单缓存一律失效。
+                self._orders_cache.clear()
+            if data is None:
+                return result
+
+            if not self._valid_sale_receipt(data, order_id, requested, account_id):
+                raise WMError(
+                    "售出请求已返回，但成交回执格式异常，请刷新核对，勿自动重试",
+                    kind="api", code="sale_unconfirmed", detail=result,
+                )
+            item = data.get("item")
+            if isinstance(item, dict) and item.get("id") and item["id"] != order["item_id"]:
+                raise WMError("成交回执物品不匹配，请刷新核对，勿自动重试", code="sale_unconfirmed", detail=result)
+            result.update(
+                quantity=data["quantity"], platinum=data["platinum"], datetime=data["createdAt"],
+                transaction_id=data["id"], confirmed=True,
+            )
+            item = item or {}
+            has_item = bool(item.get("id"))
+            has_rank = item.get("rank") is not None
+            rank = item["rank"] if has_rank else order["rank"]
+            if type(rank) is int and rank >= 0:
+                identity_source = (
+                    "transaction" if has_item and has_rank
+                    else "mixed" if has_item or has_rank else "order_snapshot"
+                )
+                result["rank"] = rank
+                result["identity_source"] = identity_source
+                self._sales.remember({
+                    "wm_user_id": account_id, "item_id": order["item_id"], "rank": rank,
+                    "order_id": order_id, "transaction_id": data["id"],
+                    "platinum": data["platinum"], "quantity": data["quantity"],
+                    "datetime": data["createdAt"], "source": "local",
+                    "identity_source": identity_source,
+                })
+                result["history_recorded"] = True
+            return result
+
+    @staticmethod
+    def _valid_sale_receipt(data: Any, order_id: str, requested: int, account_id: str) -> bool:
+        if not isinstance(data, dict):
+            return False
+        user = data.get("user")
+        return (
+            isinstance(data.get("id"), str) and bool(data["id"])
+            and data.get("originId") == order_id and data.get("type") == "sell"
+            and type(data.get("quantity")) is int and 1 <= data["quantity"] <= requested
+            and _sale_platinum(data.get("platinum"))
+            and _sale_datetime(data.get("createdAt")) is not None
+            and (data.get("item") is None or isinstance(data["item"], dict))
+            and (user is None or (isinstance(user, dict) and user.get("id") == account_id))
+        )
+
+    async def get_last_sale_price(
+        self,
+        item_id: str,
+        session: WMSession,
+        *,
+        rank: Optional[int] = 0,
+    ) -> Optional[dict]:
+        """取本插件记录的当前 WM 账号、同物品、同等级最近一次售出回执。
+
+        官方 v0.25 文档未公开账号逐笔成交查询端点，旧版个人 statistics 的当前
+        契约未获证实，因此不猜远端路径、不以商品聚合统计代替成交。
+        只查询会话文件旁 wm_sales.json 的已确认回执；不代表账号全部交易历史。
+        返回含 platinum/datetime/quantity/item_id/rank/transaction_id/order_id/
+        wm_user_id/source/identity_source 的字典，source 固定为 local；没有本地
+        记录则 None。identity_source 为 transaction、order_snapshot 或 mixed，
+        分别表示物品身份来自回执、售出前订单快照或两者混合。
+        rank=None 与无等级订单统一按 0 精确匹配，不跨等级选价。
+        """
+        item_id = str(item_id or "").strip()
+        if not item_id:
+            raise WMError("缺少物品 ID", kind="config")
+        rank = 0 if rank is None else rank
+        if type(rank) is not int or rank < 0:
+            raise WMError("等级必须是非负整数", kind="config")
+        account_id = await self._sale_account_id(session)
+        return self._sales.latest(account_id, item_id, rank)
 
     async def get_statistics(self, slug: str, *, rank: Optional[int] = None) -> dict:
         """v1 历史统计（48 小时 / 90 天）。官方 v2 没给等价合同，属于可选功能。"""

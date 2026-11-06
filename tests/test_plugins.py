@@ -56,10 +56,26 @@ class PluginLoadingTests(unittest.TestCase):
                 with patch("socket.socket.connect", side_effect=AssertionError("测试不应连接网络")):
                     main.main(["--init-config"])
                     expected = sorted(iter_plugin_modules())
-                    assert len(expected) == 7, expected
+                    assert len(expected) == 8, expected
                     assert all(name in sys.modules for name in expected)
                     assert set(all_plugin_configs()) == {"yiff", "wm", "e5"}
                     assert "check" in Listeners
+                    assert {"help", "wmitems", "wmbump", "wmreprice"} <= set(Listeners)
+                    assert {"wm:list:", "wm:bump"} <= set(Buttons)
+                    from types import SimpleNamespace
+                    from unittest.mock import AsyncMock
+
+                    async def help_commands():
+                        ctx = SimpleNamespace(reply_text=AsyncMock())
+                        await Listeners["help"][0](ctx)
+                        return {
+                            line.split(" — ", 1)[0][1:]
+                            for call in ctx.reply_text.await_args_list
+                            for line in call.args[0].splitlines()
+                            if line.startswith("/")
+                        }
+
+                    assert await help_commands() == set(Listeners)
                     assert "/e5/callback" in webhook_routes()
                     assert Path("config/e5/e5_accounts.sqlite3").exists()
                     assert not Path("config.json").exists()
@@ -85,6 +101,8 @@ class PluginLoadingTests(unittest.TestCase):
                         hook_names(),
                     )
                     assert before == after
+                    assert await help_commands() == set(Listeners)
+                    assert len(Listeners["help"]) == 1
                     assert all(sys.modules[name] is not module for name, module in old_modules.items())
                     from plugins.e5 import e5
                     assert e5.service is not service
@@ -120,7 +138,7 @@ class PluginLoadingTests(unittest.TestCase):
             async def exercise():
                 with patch("socket.socket.connect", side_effect=AssertionError("测试不应连接网络")):
                     loaded = load_all_plugins()
-                    assert len(loaded) == 7, loaded
+                    assert len(loaded) == 8, loaded
                     from plugins.e5.e5 import service
                     assert service.store.get_pending(101)["state"] == "keep-state"
                     assert service._task is None
